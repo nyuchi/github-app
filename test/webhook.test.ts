@@ -60,6 +60,14 @@ test("team mentions do not summon a review; the bare handle does", () => {
   );
   assert.equal(teamMention("@nyuchi review", "@nyuchi"), false);
   assert.equal(teamMention("nothing here", "@nyuchi"), false);
+  // review finding: an email address is not a mention, here or in the engine
+  assert.equal(
+    teamMention(
+      "@nyuchi/platform please look, cc security@nyuchi.com",
+      "@nyuchi",
+    ),
+    true,
+  );
 });
 
 test("no webhook secret: 503, fail closed", async () => {
@@ -188,7 +196,12 @@ test("review and triage kill switches skip before anything is spent", async () =
     assert.match(JSON.stringify(await r1.json()), /review disabled/);
     const issue = {
       action: "opened",
-      issue: { number: 4, user: { type: "User" }, labels: [] },
+      issue: {
+        number: 4,
+        user: { type: "User" },
+        labels: [],
+        author_association: "MEMBER",
+      },
       installation: { id: 77 },
       repository: { full_name: "nyuchi/lic", owner: { login: "nyuchi" } },
     };

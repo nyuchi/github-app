@@ -42,15 +42,39 @@ This Worker only decides **which commits are releases**:
   request is a release on its own.
 - Releases are tagged oldest first, each at the next version above the highest
   existing tag. Only the newest default-branch release is marked "latest".
-- At most `BACKFILL_MAX_PER_REPO` tags per repository per run. The rest are
-  reported as pending.
+- At most `BACKFILL_MAX_PER_REPO` tags per repository per run, and
+  `NIGHTLY_MAX_TAGS` across one night. The rest are reported as pending. The
+  org order rotates daily.
+- If a branch has more untagged history than the scan reads (10 pages) and no
+  tag in sight, nothing is tagged and the run says so. Tagging only the
+  visible part would strand the older merges for good.
+- Immediately before each write, the live tags are read again. The write is
+  abandoned when any of these has happened since planning:
+  - the name was taken;
+  - the commit gained a version tag;
+  - the highest version moved.
+
+  Creating the ref is the final atomic guard: GitHub answers 422 when it
+  already exists.
+
+- The newest tag on each branch is given its GitHub release if a run made the
+  tag but failed on the release.
+- A staging-tagged commit that reaches the default branch by fast-forward
+  gets no minor tag, because the walk stops at its tag. Rulesets allow only
+  squash and rebase merges through pull requests, and both create new
+  commits, so this only happens through a ruleset bypass.
 
 ### What it will not tag
 
-- **Repositories with workflows that start on tags or releases** (`push: tags`,
-  `release`, `create`). A tag made by an App starts workflows, which a
-  `GITHUB_TOKEN` tag does not. A beta tag could therefore run a production
-  publish, so these repositories are reported and left alone.
+- **Repositories with workflows that can start on a tag push or a release.**
+  This means `push: tags`, `release`, `create` and `workflow_run`, and also
+  any `push` with no `branches` filter, because GitHub runs that for tags
+  too. A tag made by an App starts workflows, which a `GITHUB_TOKEN` tag does
+  not, so a beta tag could run a production publish.
+  - This is checked against the default branch's workflows **and** the
+    workflows at every commit about to be tagged. A tag push runs the files at
+    the tagged commit.
+  - These repositories are reported and left alone.
 - **A channel the repository still tags itself** (`reusable-staging-release`,
   `reusable-auto-tag`, `reusable-release`). These are skipped **on push**, so
   the two never race. The nightly pass still fills any gap.
@@ -78,7 +102,9 @@ This Worker adds the enterprise org allowlist and the `@nyuchi` handle. A team
 mention such as `@nyuchi/platform` does not count as asking.
 
 Triage asks the same model to choose up to three of the repository's existing
-labels. It never creates a label, and never closes, assigns or comments.
+labels. It never creates a label, and never closes, assigns or comments. Only
+issues from owners, members, collaborators and contributors are triaged
+(`TRIAGE_TRIGGER_ASSOCIATIONS`), so a stranger cannot spend model calls.
 
 No Anthropic API is used anywhere.
 

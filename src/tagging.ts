@@ -40,6 +40,12 @@ export interface PlannedTag {
   prerelease: boolean;
   /** Mark this release "latest" (only the newest default-branch release). */
   latest: boolean;
+  /**
+   * The highest released version this tag was planned on top of. Re-checked
+   * against the live tags immediately before the tag is written: if it moved,
+   * the plan is stale and nothing is written.
+   */
+  after: string;
 }
 
 export interface Plan {
@@ -143,6 +149,7 @@ export function planBranch(input: {
       pr: g.pr,
       prerelease: input.channel === "staging",
       latest: false,
+      after: current,
     });
     current = version;
   }
@@ -172,20 +179,37 @@ export interface WorkflowFacts {
   unreadable: string[];
 }
 
-/** Does one workflow's `on:` start on a tag push or a release? */
+/**
+ * Can one workflow's `on:` start because of a tag push or a release?
+ *
+ * Erring towards yes is the point: a false "yes" only means the app leaves a
+ * repository to its own workflows; a false "no" means an App-made tag can run
+ * a publish job. So, besides the obvious `release`, `create` and
+ * `push: tags`, these all count:
+ *
+ * - a `push` with no `branches`/`branches-ignore` filter. GitHub runs it for
+ *   tag pushes too (path filters are not evaluated for tags), and a publish
+ *   job behind `if: startsWith(github.ref, 'refs/tags/')` is a common shape;
+ * - `workflow_run`, which can chain off a run that a tag started.
+ */
 export function startsOnTagOrRelease(on: unknown): boolean {
-  if (typeof on === "string") return on === "release" || on === "create";
-  if (Array.isArray(on)) return on.includes("release") || on.includes("create");
+  const TAG_EVENTS = ["release", "create", "workflow_run", "push"];
+  if (typeof on === "string") return TAG_EVENTS.includes(on);
+  if (Array.isArray(on)) return on.some((e) => TAG_EVENTS.includes(String(e)));
   if (on && typeof on === "object") {
     const o = on as Record<string, unknown>;
-    if ("release" in o || "create" in o) return true;
-    const push = o.push;
-    if (push && typeof push === "object") {
-      const p = push as Record<string, unknown>;
-      if ("tags" in p || "tags-ignore" in p) return true;
+    if ("release" in o || "create" in o || "workflow_run" in o) return true;
+    if ("push" in o) {
+      const p = o.push;
+      if (!p || typeof p !== "object") return true; // bare `push:`
+      const f = p as Record<string, unknown>;
+      if ("tags" in f || "tags-ignore" in f) return true;
+      if (!("branches" in f) && !("branches-ignore" in f)) return true;
     }
+    return false;
   }
-  return false;
+  // Anything unrecognised (a number, `true` from a YAML 1.1 `on`): unsure.
+  return on !== undefined && on !== null;
 }
 
 /** Read the facts from the text of each `.github/workflows/*.yml`. */

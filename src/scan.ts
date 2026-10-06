@@ -1,9 +1,10 @@
 // Reading a repository and acting on the tagging plan.
 //
-// One GraphQL query per repository reads everything the plan needs: both
-// branch histories with each commit's pull request, the tags (peeled), and
-// the text of every workflow file. The nightly pass over ~100 repositories is
-// then ~100 queries, well inside a Worker's subrequest budget.
+// One GraphQL query per repository reads what the plan needs: both branch
+// histories with each commit's pull request, the tags (peeled), and the text
+// of every workflow file on the default branch. Then, only for commits about
+// to be tagged, one more query reads THEIR workflow files, and immediately
+// before each write the tags are read again (see assertStillValid).
 
 import type { Env } from "./env";
 import { repoExcluded } from "./env";
@@ -18,15 +19,18 @@ import {
   classifyWorkflows,
   foreignTagScheme,
   planBranch,
+  versionTags,
 } from "./tagging";
+import { highest } from "./policy/next-version.mjs";
 
 const HISTORY = `
   target {
     ... on Commit {
       history(first: $hist, since: $since) {
+        pageInfo { hasNextPage endCursor }
         nodes {
           oid
-          associatedPullRequests(first: 1) { nodes { number merged } }
+          associatedPullRequests(first: 5) { nodes { number merged baseRefName } }
         }
       }
     }
@@ -54,6 +58,28 @@ query Repo($owner: String!, $name: String!, $staging: String!, $hist: Int!, $sin
   }
 }`;
 
+const HISTORY_PAGE_QUERY = `
+query More($owner: String!, $name: String!, $qualified: String!, $hist: Int!, $since: GitTimestamp!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    ref(qualifiedName: $qualified) {
+      target {
+        ... on Commit {
+          history(first: $hist, since: $since, after: $after) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              oid
+              associatedPullRequests(first: 5) { nodes { number merged baseRefName } }
+            }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+/** Most history pages read per branch before giving up (fail closed). */
+const MAX_HISTORY_PAGES = 10;
+
 const TAGS_QUERY = `
 query Tags($owner: String!, $name: String!, $tagsAfter: String) {
   repository(owner: $owner, name: $name) {
@@ -66,11 +92,17 @@ query Tags($owner: String!, $name: String!, $tagsAfter: String) {
 
 interface HistoryNode {
   oid: string;
-  associatedPullRequests?: { nodes: { number: number; merged: boolean }[] };
+  associatedPullRequests?: {
+    nodes: { number: number; merged: boolean; baseRefName?: string }[];
+  };
+}
+interface HistoryPage {
+  pageInfo?: { hasNextPage: boolean; endCursor: string | null };
+  nodes: HistoryNode[];
 }
 interface BranchNode {
   name: string;
-  target?: { history?: { nodes: HistoryNode[] } };
+  target?: { history?: HistoryPage };
 }
 interface TagNode {
   name: string;
@@ -79,6 +111,12 @@ interface TagNode {
 interface TagPage {
   pageInfo: { hasNextPage: boolean; endCursor: string | null };
   nodes: TagNode[];
+}
+interface RepoTree {
+  entries?: {
+    name: string;
+    object?: { text?: string | null; isBinary?: boolean };
+  }[];
 }
 interface RepoData {
   repository: {
@@ -98,10 +136,22 @@ interface RepoData {
   } | null;
 }
 
-/** Commits newest first, each with the merged pull request GitHub links it to. */
-export function toCommits(b: BranchNode | null): Commit[] {
-  return (b?.target?.history?.nodes ?? []).map((n) => {
-    const pr = n.associatedPullRequests?.nodes?.find((p) => p.merged);
+/**
+ * Commits newest first, each with the pull request that merged it INTO THIS
+ * BRANCH. An open release PR (staging -> main) also lists every staging
+ * commit, so "the first associated PR" is not enough: a merged PR whose base
+ * is this branch wins, then any merged PR.
+ */
+export function toCommits(
+  b: BranchNode | null,
+  nodes: HistoryNode[] = b?.target?.history?.nodes ?? [],
+): Commit[] {
+  const branch = b?.name;
+  return nodes.map((n) => {
+    const prs = n.associatedPullRequests?.nodes ?? [];
+    const pr =
+      prs.find((p) => p.merged && p.baseRefName === branch) ??
+      prs.find((p) => p.merged);
     return { oid: n.oid, pr: pr ? pr.number : null };
   });
 }
@@ -136,6 +186,8 @@ export interface ScanOptions {
   /** Only this channel (a push); default both. */
   only?: Channel;
   live: boolean;
+  /** Tags this run may still create, shared across repositories (nightly). */
+  budget?: { remaining: number };
 }
 
 const sinceIso = (env: Env) => {
@@ -177,19 +229,7 @@ export async function scanRepo(
   if (r.isFork) return { ...report, skipped: "fork" };
   if (r.isEmpty || !r.defaultBranchRef) return { ...report, skipped: "empty" };
 
-  const tagNodes = [...r.tags.nodes];
-  let page = r.tags.pageInfo;
-  for (let i = 0; page.hasNextPage && i < 50; i++) {
-    const more = await graphql<{ repository: { tags: TagPage } }>(
-      env,
-      token,
-      TAGS_QUERY,
-      { owner, name, tagsAfter: page.endCursor },
-    );
-    tagNodes.push(...more.repository.tags.nodes);
-    page = more.repository.tags.pageInfo;
-  }
-  const tags = tagNodes.map(toTagRef);
+  const tags = await allTags(env, token, owner, name, r.tags);
   if (foreignTagScheme(tags, prefix)) {
     return { ...report, skipped: `tags do not follow ${prefix}<semver>` };
   }
@@ -222,17 +262,81 @@ export async function scanRepo(
       });
       continue;
     }
+    const history = await readHistory(
+      env,
+      token,
+      owner,
+      name,
+      node,
+      tags,
+      prefix,
+      hist,
+    );
+    if (history.incomplete) {
+      report.channels.push({
+        channel,
+        branch: node.name,
+        planned: [],
+        created: [],
+        pending: 0,
+        note: `more than ${history.commits.length} commits since BACKFILL_SINCE and none tagged; not tagging (move BACKFILL_SINCE or tag by hand)`,
+      });
+      continue;
+    }
     const plan = planBranch({
       channel,
-      history: toCommits(node),
+      history: history.commits,
       tags,
       prefix,
       max,
     });
+    // The publish guard above read the default branch's workflows. A tag
+    // push runs the workflows AT THE TAGGED COMMIT, which on staging or in an
+    // old merge can differ, so every commit about to be tagged is checked too.
+    const publishing = await publishingCommits(
+      env,
+      token,
+      owner,
+      name,
+      plan.tags.map((t) => t.commit),
+    );
+    if (publishing.length) {
+      report.channels.push({
+        channel,
+        branch: node.name,
+        planned: [],
+        created: [],
+        pending: plan.tags.length + plan.pending,
+        note: `a workflow at ${publishing.map((c) => c.slice(0, 7)).join(", ")} starts on tags or releases; an App-made tag would start it`,
+      });
+      continue;
+    }
     const created: string[] = [];
+    let note = plan.stopped;
     if (opts.live) {
+      try {
+        await repairRelease(
+          env,
+          token,
+          owner,
+          name,
+          channel,
+          history.stop,
+          prefix,
+        );
+      } catch (e) {
+        report.errors.push(
+          `release for ${history.stop?.name}: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
       for (const t of plan.tags) {
+        if (opts.budget && opts.budget.remaining <= 0) {
+          note = "tonight's tag budget is spent; continues next run";
+          break;
+        }
         try {
+          await assertStillValid(env, token, owner, name, t, prefix);
+          if (opts.budget) opts.budget.remaining--;
           await createTagAndRelease(env, token, repo, t);
           created.push(t.tag);
           tags.push({ name: t.tag, commit: t.commit });
@@ -255,11 +359,217 @@ export async function scanRepo(
       branch: node.name,
       planned: plan.tags,
       created,
-      pending: plan.pending,
-      note: plan.stopped,
+      pending:
+        plan.pending + (opts.live ? plan.tags.length - created.length : 0),
+      note,
     });
   }
   return report;
+}
+
+/**
+ * A branch's history back to its newest version-tagged commit (or to
+ * BACKFILL_SINCE), following pages. If neither is reached within
+ * MAX_HISTORY_PAGES, `incomplete` is set and the caller tags nothing: tagging
+ * only the visible part would strand the older merges forever, because the
+ * next walk stops at the tags just made.
+ */
+export async function readHistory(
+  env: Env,
+  token: string,
+  owner: string,
+  name: string,
+  node: BranchNode,
+  tags: TagRef[],
+  prefix: string,
+  hist: number,
+): Promise<{ commits: Commit[]; incomplete: boolean; stop?: TagRef }> {
+  const vt = versionTags(tags, prefix);
+  const tagOf = (oid: string) => vt.find((t) => t.commit === oid);
+  const nodes: HistoryNode[] = [...(node.target?.history?.nodes ?? [])];
+  let info = node.target?.history?.pageInfo;
+  let stop = nodes.map((n) => tagOf(n.oid)).find(Boolean);
+  for (let i = 1; !stop && info?.hasNextPage && i < MAX_HISTORY_PAGES; i++) {
+    const more = await graphql<{
+      repository: { ref: { target?: { history?: HistoryPage } } | null };
+    }>(env, token, HISTORY_PAGE_QUERY, {
+      owner,
+      name,
+      qualified: `refs/heads/${node.name}`,
+      hist,
+      since: sinceIso(env),
+      after: info.endCursor,
+    });
+    const page = more.repository.ref?.target?.history;
+    if (!page) break;
+    nodes.push(...page.nodes);
+    info = page.pageInfo;
+    stop = page.nodes.map((n) => tagOf(n.oid)).find(Boolean);
+  }
+  return {
+    commits: toCommits(node, nodes),
+    incomplete: !stop && Boolean(info?.hasNextPage),
+    stop,
+  };
+}
+
+/**
+ * The newest tag on a branch must have its GitHub release. A run that made
+ * the tag but failed on the release would otherwise never retry it: the next
+ * walk stops at that tag. Skipped when that commit's workflows would start
+ * on a release.
+ */
+export async function repairRelease(
+  env: Env,
+  token: string,
+  owner: string,
+  name: string,
+  channel: Channel,
+  tag: TagRef | undefined,
+  prefix: string,
+): Promise<boolean> {
+  if (!tag || !versionTags([tag], prefix).length) return false;
+  try {
+    await gh(
+      env,
+      token,
+      `/repos/${owner}/${name}/releases/tags/${encodeURIComponent(tag.name)}`,
+    );
+    return false; // it has one
+  } catch (e) {
+    if (!(e instanceof AppError) || e.status !== 404) throw e;
+  }
+  if ((await publishingCommits(env, token, owner, name, [tag.commit])).length) {
+    return false;
+  }
+  await gh(env, token, `/repos/${owner}/${name}/releases`, {
+    method: "POST",
+    body: JSON.stringify({
+      tag_name: tag.name,
+      name: channel === "staging" ? `${tag.name} (beta)` : tag.name,
+      prerelease: channel === "staging",
+      make_latest: "false",
+      generate_release_notes: true,
+    }),
+  });
+  return true;
+}
+
+/** Every tag of the repository, peeled, starting from an already-read page. */
+export async function allTags(
+  env: Env,
+  token: string,
+  owner: string,
+  name: string,
+  first?: TagPage,
+): Promise<TagRef[]> {
+  let page: TagPage =
+    first ??
+    (
+      await graphql<{ repository: { tags: TagPage } }>(env, token, TAGS_QUERY, {
+        owner,
+        name,
+        tagsAfter: null,
+      })
+    ).repository.tags;
+  const nodes = [...page.nodes];
+  for (let i = 0; page.pageInfo.hasNextPage && i < 50; i++) {
+    page = (
+      await graphql<{ repository: { tags: TagPage } }>(env, token, TAGS_QUERY, {
+        owner,
+        name,
+        tagsAfter: page.pageInfo.endCursor,
+      })
+    ).repository.tags;
+    nodes.push(...page.nodes);
+  }
+  if (page.pageInfo.hasNextPage) {
+    // Not every tag was read, so "highest" and "already tagged" are unknown.
+    throw new AppError(
+      `${owner}/${name}: more than 5,100 tags; not tagging`,
+      409,
+    );
+  }
+  return nodes.map(toTagRef);
+}
+
+/** The commits whose own .github/workflows start on tags or releases. */
+export async function publishingCommits(
+  env: Env,
+  token: string,
+  owner: string,
+  name: string,
+  oids: string[],
+): Promise<string[]> {
+  const unique = [...new Set(oids)].filter((o) => /^[0-9a-f]{40}$/i.test(o));
+  if (unique.length !== new Set(oids).size) {
+    // Not a full commit id: cannot be looked up, so cannot be cleared.
+    return oids;
+  }
+  if (!unique.length) return [];
+  const fields = unique
+    .map(
+      (oid, i) =>
+        `w${i}: object(expression: "${oid}:.github/workflows") { ... on Tree { entries { name object { ... on Blob { text isBinary } } } } }`,
+    )
+    .join("\n");
+  const data = await graphql<{
+    repository: Record<string, RepoTree | null>;
+  }>(
+    env,
+    token,
+    `query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { ${fields} } }`,
+    { owner, name },
+  );
+  return unique.filter((_, i) => {
+    const tree = data.repository[`w${i}`];
+    const facts = classifyWorkflows(
+      (tree?.entries ?? []).map((e) => ({
+        name: e.name,
+        text: e.object && !e.object.isBinary ? (e.object.text ?? null) : null,
+      })),
+    );
+    return facts.publishesOnTag;
+  });
+}
+
+/**
+ * Re-read the live tags immediately before writing, and refuse when the plan
+ * is stale: the name is taken, the commit already carries a version, or the
+ * highest version is no longer the one this tag was planned on top of. The
+ * ref creation itself is the final, atomic guard against a same-name race
+ * (GitHub answers 422 "Reference already exists").
+ */
+export async function assertStillValid(
+  env: Env,
+  token: string,
+  owner: string,
+  name: string,
+  t: PlannedTag,
+  prefix: string,
+): Promise<void> {
+  const live = await allTags(env, token, owner, name);
+  if (live.some((x) => x.name === t.tag)) {
+    throw new AppError(`${t.tag} already exists; plan is stale`, 409);
+  }
+  const vt = versionTags(live, prefix);
+  const onCommit = vt.find((x) => x.commit === t.commit);
+  if (onCommit) {
+    throw new AppError(
+      `${t.commit.slice(0, 7)} is already tagged ${onCommit.name}; plan is stale`,
+      409,
+    );
+  }
+  const now = highest(
+    vt.map((x) => `refs/tags/${x.name}`),
+    prefix,
+  );
+  if (now !== t.after) {
+    throw new AppError(
+      `highest version moved from ${t.after} to ${now}; plan is stale`,
+      409,
+    );
+  }
 }
 
 /**

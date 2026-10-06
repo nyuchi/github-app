@@ -11,7 +11,12 @@ import { mockFetch, testEnv } from "./helpers";
 
 const opened = (over: Record<string, unknown> = {}) => ({
   action: "opened",
-  issue: { number: 9, user: { type: "User" }, labels: [] },
+  issue: {
+    number: 9,
+    user: { type: "User" },
+    labels: [],
+    author_association: "MEMBER",
+  },
   installation: { id: 5 },
   repository: { full_name: "mukoko-dev/x" },
   ...over,
@@ -124,4 +129,20 @@ test("triage labels the issue with the model's valid choices only", async () => 
   } finally {
     m.restore();
   }
+});
+
+test("review finding: strangers cannot spend triage (author_association gate)", () => {
+  const p = (assoc: string) =>
+    opened({
+      issue: {
+        number: 9,
+        user: { type: "User" },
+        labels: [],
+        author_association: assoc,
+      },
+    });
+  assert.equal(decideTriage(p("NONE")).run, "skip");
+  assert.equal(decideTriage(p("FIRST_TIME_CONTRIBUTOR")).run, "skip");
+  assert.equal(decideTriage(p("CONTRIBUTOR")).run, "triage");
+  assert.equal(decideTriage(p("MEMBER"), ["OWNER"]).run, "skip");
 });

@@ -57,10 +57,34 @@ export interface NightlyResult {
 }
 
 /** The nightly pass: every allowed org's installation, every repository. */
-export async function nightly(env: Env): Promise<NightlyResult> {
+/**
+ * Start the org list at a different place each day, so a run that spends its
+ * tag budget (or hits a limit) does not starve the same trailing orgs.
+ */
+export function rotate<T>(items: T[], now = Date.now()): T[] {
+  if (!items.length) return items;
+  const day = Math.floor(now / 86_400_000);
+  const k = day % items.length;
+  return [...items.slice(k), ...items.slice(0, k)];
+}
+
+export async function nightly(
+  env: Env,
+  now = Date.now(),
+): Promise<NightlyResult> {
   const live = env.TAGGING_MODE === "live";
   const result: NightlyResult = { orgs: [], repos: 0, reports: [], errors: [] };
-  const installs = await listInstallations(env);
+  // A ceiling on tags per night: each costs ~5 subrequests, and a first live
+  // night across the enterprise must not run into the Worker's limit.
+  const budget = {
+    remaining: Math.max(0, Number(env.NIGHTLY_MAX_TAGS) || 300),
+  };
+  const installs = rotate(
+    (await listInstallations(env)).sort((a, b) =>
+      a.account.login.localeCompare(b.account.login),
+    ),
+    now,
+  );
   for (const inst of installs) {
     const org = inst.account?.login;
     if (!orgAllowed(env, org) || inst.suspended_at) continue;
@@ -89,6 +113,7 @@ export async function nightly(env: Env): Promise<NightlyResult> {
           await scanRepo(env, token, r.owner.login, r.name, {
             trigger: "nightly",
             live,
+            budget,
           }),
         );
       } catch (e) {

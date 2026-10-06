@@ -171,6 +171,33 @@ test("a foreign tag scheme is detected; no tags at all is not foreign", () => {
   );
 });
 
+test("finding 1: triggers that run on a tag push without naming tags count as publishing", () => {
+  // GitHub runs a push workflow with no branches filter for tag pushes too,
+  // and path filters are not evaluated for tags.
+  assert.equal(startsOnTagOrRelease("push"), true);
+  assert.equal(startsOnTagOrRelease(["push", "pull_request"]), true);
+  assert.equal(startsOnTagOrRelease({ push: null }), true);
+  assert.equal(startsOnTagOrRelease({ push: { paths: ["src/**"] } }), true);
+  assert.equal(
+    startsOnTagOrRelease({ workflow_run: { workflows: ["CI"] } }),
+    true,
+  );
+  assert.equal(startsOnTagOrRelease(true), true);
+  // Branch-only pushes do not run for tags.
+  assert.equal(startsOnTagOrRelease({ push: { branches: ["main"] } }), false);
+  assert.equal(
+    startsOnTagOrRelease({ push: { "branches-ignore": ["x"] } }),
+    false,
+  );
+  const facts = classifyWorkflows([
+    {
+      name: "rust-release.yml",
+      text: "on: push\njobs:\n  publish:\n    if: startsWith(github.ref, 'refs/tags/')\n    runs-on: ubuntu-latest\n    steps: []\n",
+    },
+  ]);
+  assert.equal(facts.publishesOnTag, true);
+});
+
 test("on: triggers that start on tags or releases", () => {
   assert.equal(startsOnTagOrRelease("release"), true);
   assert.equal(startsOnTagOrRelease(["push", "release"]), true);
@@ -183,7 +210,6 @@ test("on: triggers that start on tags or releases", () => {
   assert.equal(startsOnTagOrRelease({ create: null }), true);
   assert.equal(startsOnTagOrRelease({ push: { branches: ["main"] } }), false);
   assert.equal(startsOnTagOrRelease({ pull_request: null }), false);
-  assert.equal(startsOnTagOrRelease("push"), false);
 });
 
 test("workflow facts: own tagging, publishing, docker `tags:` inputs are not triggers", () => {

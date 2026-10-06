@@ -21,6 +21,9 @@ crons = ["17 1 * * *"]
 # The nightly pass reads ~100 repositories and parses their workflow files.
 [limits]
 cpu_ms = 120000
+# Paid default is 10,000. A live night is ~5 per tag plus 2-3 per repository;
+# NIGHTLY_MAX_TAGS keeps it well under this ceiling.
+subrequests = 50000
 
 # Every value here is public policy. `wrangler deploy` REPLACES [vars], so a
 # setting made only in the dashboard is lost on the next deploy.
@@ -46,6 +49,7 @@ TAG_PREFIX = "v"
 # with years of history and no tags does not grow hundreds of versions.
 BACKFILL_SINCE = "2026-10-04T00:00:00Z"
 BACKFILL_MAX_PER_REPO = "10"
+NIGHTLY_MAX_TAGS = "300"
 SCAN_HISTORY = "50"
 
 # ---- Review (the shared Shamwari engine) ------------------------------------
@@ -57,6 +61,8 @@ AI_GATEWAY_ID = "fundi"
 # Kill switches: exactly "false" turns each off without a code change.
 REVIEW_ENABLED = "true"
 TRIAGE_ENABLED = "true"
+# Spending gate: whose new issues are triaged.
+TRIAGE_TRIGGER_ASSOCIATIONS = "OWNER,MEMBER,COLLABORATOR,CONTRIBUTOR"
 
 # Workers AI: no API key, no third-party credential. No Anthropic API.
 [ai]

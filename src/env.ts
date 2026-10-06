@@ -45,8 +45,10 @@ export interface Env {
   BACKFILL_SINCE?: string;
   /** Most tags the app creates in one repository per run (default 10). */
   BACKFILL_MAX_PER_REPO?: string;
-  /** How many commits of each branch the scan reads (default 50, max 100). */
+  /** Commits per history page the scan reads (default 50, max 100). */
   SCAN_HISTORY?: string;
+  /** Most tags the nightly pass creates across all repositories (default 300). */
+  NIGHTLY_MAX_TAGS?: string;
 
   // ---- Review (shared engine from shamwari-ai/github-app) -------------------
   AI?: ReviewEnv["AI"];
@@ -65,6 +67,12 @@ export interface Env {
   TRIAGE_ENABLED?: string;
   /** Model for triage (default: REVIEW_MODEL). */
   TRIAGE_MODEL?: string;
+  /**
+   * Whose new issues are triaged, comma-separated author_association values
+   * (default OWNER,MEMBER,COLLABORATOR,CONTRIBUTOR). A spending gate: on a
+   * public repository anyone can open issues.
+   */
+  TRIAGE_TRIGGER_ASSOCIATIONS?: string;
 }
 
 export function splitCsv(value: string | undefined): string[] {

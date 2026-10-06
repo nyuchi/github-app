@@ -20,7 +20,17 @@ export type TriageDecision =
   | { run: "skip"; reason: string };
 
 /** What an `issues` delivery should cause. Pure. */
-export function decideTriage(payload: unknown): TriageDecision {
+export const DEFAULT_TRIAGE_ASSOCIATIONS = [
+  "OWNER",
+  "MEMBER",
+  "COLLABORATOR",
+  "CONTRIBUTOR",
+];
+
+export function decideTriage(
+  payload: unknown,
+  allowed: string[] = DEFAULT_TRIAGE_ASSOCIATIONS,
+): TriageDecision {
   const p = (payload ?? {}) as Record<string, unknown>;
   if (p.action !== "opened") {
     return {
@@ -32,6 +42,15 @@ export function decideTriage(payload: unknown): TriageDecision {
   const user = (issue.user ?? {}) as Record<string, unknown>;
   if (user.type === "Bot")
     return { run: "skip", reason: "issue is from a bot" };
+  // Spending gate, as for reviews: a stranger opening issues on a public
+  // repository must not be able to bill model calls to the account.
+  const assoc =
+    typeof issue.author_association === "string"
+      ? issue.author_association
+      : "";
+  if (!allowed.includes(assoc)) {
+    return { run: "skip", reason: "author may not trigger triage" };
+  }
   if (Array.isArray(issue.labels) && issue.labels.length > 0) {
     return { run: "skip", reason: "issue already has labels" };
   }

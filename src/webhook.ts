@@ -74,10 +74,15 @@ export function decidePush(
  * Is this comment a mention of the handle and not of a team under an org of
  * the same name? "@nyuchi/platform" is a team mention, not a request.
  */
+// TODO(shamwari-ai/github-app#7): drop this once the engine's mentions()
+// stops counting "@handle/team" as a mention.
 export function teamMention(body: unknown, handle: string): boolean {
   if (typeof body !== "string") return false;
   const h = handle.replace(/^@/, "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const all = body.match(new RegExp(`@${h}(?![\\w-])(/)?`, "gi")) ?? [];
+  // The engine's own left boundary, so an email address (x@nyuchi.com) is
+  // not counted here when the engine would not count it either.
+  const all =
+    body.match(new RegExp(`(^|[^\\w@/-])@${h}(?![\\w-])(/)?`, "gi")) ?? [];
   return all.length > 0 && all.every((m) => m.endsWith("/"));
 }
 
@@ -153,7 +158,8 @@ export async function handleWebhook(
   }
 
   if (event === "issues") {
-    const d = decideTriage(payload);
+    const assoc = splitCsv(env.TRIAGE_TRIGGER_ASSOCIATIONS);
+    const d = decideTriage(payload, assoc.length ? assoc : undefined);
     if (d.run === "skip") return json({ ok: true, skipped: d.reason });
     if (env.TRIAGE_ENABLED === "false")
       return json({ ok: true, skipped: "triage disabled" });
@@ -228,6 +234,8 @@ async function runTagging(
   }
 }
 
+// A near-copy of the engine's unexported run(); TODO(shamwari-ai/github-app#7):
+// call the engine's exported dispatch once it exists.
 async function runReview(
   env: Env,
   d: Exclude<ReturnType<typeof decide>, { run: "skip" }>,
@@ -264,6 +272,7 @@ async function runReview(
         posted: result.posted,
         skipped: result.skipped,
         findings: result.findings.length,
+        unanchored: result.unanchored.length,
         model: result.model,
       }),
     );
