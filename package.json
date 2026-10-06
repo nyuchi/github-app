@@ -1,0 +1,33 @@
+{
+  "name": "nyuchi-github-app",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The Nyuchi GitHub App: release tagging, code review and triage across the bundu-labs enterprise, on Cloudflare Workers",
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit && tsc --noEmit -p test",
+    "check": "vp check",
+    "lint": "vp lint",
+    "fmt": "vp fmt",
+    "test": "tsx --test test/*.test.ts",
+    "policy:check": "scripts/check-policy.sh",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "shamwari-github-mcp": "github:shamwari-ai/github-app#ae94b6acac6dfe3fc074a13dd5705b88cd758e1a",
+    "yaml": "^2.8.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260721.1",
+    "@types/node": "^22.20.5",
+    "tsx": "^4.23.13",
+    "typescript": "^5.9.3",
+    "vite-plus": "^1.0.0",
+    "wrangler": "^4.147.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nyuchi/github-app.git"
+  }
+}

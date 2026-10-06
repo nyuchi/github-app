@@ -1,0 +1,83 @@
+name = "nyuchi-github-app"
+main = "src/index.ts"
+compatibility_date = "2025-06-01"
+# The vendored policy (src/policy/next-version.mjs) is also a CLI: it imports
+# node:url and reads process.argv to tell whether it was run directly.
+compatibility_flags = ["nodejs_compat"]
+
+# Nyuchi Web Services, the account that hosts shamwari-github-mcp.
+account_id = "125a2dfbc21f76a25c980609609e8218"
+
+# The App's webhook URL is https://nyuchi-github-app.nyuchi.workers.dev/webhook.
+# No custom domain: GitHub is the only caller.
+workers_dev = true
+# Beta: staging uploads a preview version aliased "staging", never deployed.
+preview_urls = true
+
+# Nightly tag backfill, 01:17 UTC (off the hour, when GitHub is busiest).
+[triggers]
+crons = ["17 1 * * *"]
+
+# The nightly pass reads ~100 repositories and parses their workflow files.
+[limits]
+cpu_ms = 120000
+
+# Every value here is public policy. `wrangler deploy` REPLACES [vars], so a
+# setting made only in the dashboard is lost on the next deploy.
+[vars]
+GITHUB_API = "https://api.github.com"
+# The Nyuchi App (slug `nyuchi`), moving to the bundu-labs enterprise. An id
+# is not a credential: it grants nothing without the private key.
+GITHUB_APP_ID = "4980118"
+
+# OUTER BOUND. The bundu-labs enterprise orgs. nyuchiGOV is outside the
+# enterprise and is never listed. Empty denies everything.
+ALLOWED_ORGS = "bundu-labs,mukoko-dev,mzizi-dev,nyuchi,openNTL,shamwari-ai,siafuDB"
+# Same exclusions as the enterprise rulesets.
+EXCLUDED_REPOS = "sandbox-*,archive-*"
+
+# ---- Release tagging (nyuchi/.github#80, #90) ------------------------------
+# "dry-run" logs what the app would tag and touches nothing. Switch to "live"
+# by pull request after a dry-run night has been read.
+TAGGING_MODE = "dry-run"
+STAGING_BRANCH = "staging"
+TAG_PREFIX = "v"
+# The nightly pass looks at merges after this date only, so a repository
+# with years of history and no tags does not grow hundreds of versions.
+BACKFILL_SINCE = "2026-10-04T00:00:00Z"
+BACKFILL_MAX_PER_REPO = "10"
+SCAN_HISTORY = "50"
+
+# ---- Review (the shared Shamwari engine) ------------------------------------
+REVIEW_MODEL = "@cf/zai-org/glm-5.3"
+REVIEW_MENTION = "@nyuchi"
+REVIEW_TRIGGER_ASSOCIATIONS = "OWNER,MEMBER,COLLABORATOR"
+REVIEW_TOKEN_PERMISSIONS = "pull_requests:write,issues:write,contents:read,metadata:read"
+AI_GATEWAY_ID = "fundi"
+# Kill switches: exactly "false" turns each off without a code change.
+REVIEW_ENABLED = "true"
+TRIAGE_ENABLED = "true"
+
+# Workers AI: no API key, no third-party credential. No Anthropic API.
+[ai]
+binding = "AI"
+
+# Secrets: the account's Cloudflare Secrets Store (default_secrets_store), read
+# with `await env.X.get()`. Created by the owner; values never pass through
+# argv, a file or CI. Until they exist, /webhook answers 503 and the nightly
+# pass logs that the key is missing.
+[[secrets_store_secrets]]
+binding = "APP_PRIVATE_KEY"
+store_id = "56f84bfa8a564c54a95dbf4f4b4281b4"
+secret_name = "NYUCHI_GITHUB_APP_PRIVATE_KEY"
+
+[[secrets_store_secrets]]
+binding = "APP_WEBHOOK_SECRET"
+store_id = "56f84bfa8a564c54a95dbf4f4b4281b4"
+secret_name = "NYUCHI_GITHUB_WEBHOOK_SECRET"
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+invocation_logs = true
+persist = true

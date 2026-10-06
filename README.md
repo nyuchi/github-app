@@ -1,2 +1,126 @@
-# github-app
-The Nyuchi GitHub App: release tagging, code review and triage across the bundu-labs enterprise (Cloudflare Worker)
+# Nyuchi GitHub App
+
+> The backend of the **Nyuchi** GitHub App (app id `4980118`, slug `nyuchi`):
+> release tagging, code review and triage across every organisation in the
+> `bundu-labs` enterprise. It runs as a Cloudflare Worker, `nyuchi-github-app`.
+
+Tracking issue: [nyuchi/.github#90](https://github.com/nyuchi/.github/issues/90).
+Versioning policy: [nyuchi/.github#80](https://github.com/nyuchi/.github/issues/80).
+
+Shamwari for GitHub ([shamwari-ai/github-app](https://github.com/shamwari-ai/github-app))
+is the consumer-facing app and the MCP server. This Worker serves no people.
+It answers GitHub's webhooks and runs one nightly job.
+
+## What it does
+
+| Trigger                                      | Action                                                               |
+| -------------------------------------------- | -------------------------------------------------------------------- |
+| `push` to `staging`                          | Tags the next **PATCH** and creates a GitHub pre-release `vX (beta)` |
+| `push` to the default branch                 | Tags the next **MINOR** and creates a GitHub release                 |
+| Nightly cron (01:17 UTC)                     | Backfills every merge that was never tagged, in every installed org  |
+| `pull_request` (opened, ready, new commits)  | Code review, using the shared Shamwari engine on Workers AI          |
+| `issue_comment` mentioning `@nyuchi` on a PR | Code review on request                                               |
+| `issues` opened                              | Triage: labels from the repository's **existing** labels             |
+
+A **MAJOR** version is never automatic. A person releases one by hand.
+
+### How a version is chosen
+
+The policy is not re-implemented here. `src/policy/next-version.mjs` is a
+byte-for-byte copy of nyuchi/.github's
+`.github/actions/next-version/next-version.mjs`, taken at the commit named in
+`src/policy/POLICY_SOURCE`. CI fails if the two ever differ
+(`scripts/check-policy.sh`). To change the policy, change it in nyuchi/.github,
+then bump `POLICY_SOURCE` and run `scripts/check-policy.sh --sync`.
+
+This Worker only decides **which commits are releases**:
+
+- For each branch it walks back from the head to the first commit that already
+  carries a `v<semver>` tag. Every commit after that is unreleased.
+- Unreleased commits are grouped by the pull request that merged them. A rebase
+  merge is one release, tagged on its newest commit. A commit with no pull
+  request is a release on its own.
+- Releases are tagged oldest first, each at the next version above the highest
+  existing tag. Only the newest default-branch release is marked "latest".
+- At most `BACKFILL_MAX_PER_REPO` tags per repository per run. The rest are
+  reported as pending.
+
+### What it will not tag
+
+- **Repositories with workflows that start on tags or releases** (`push: tags`,
+  `release`, `create`). A tag made by an App starts workflows, which a
+  `GITHUB_TOKEN` tag does not. A beta tag could therefore run a production
+  publish, so these repositories are reported and left alone.
+- **A channel the repository still tags itself** (`reusable-staging-release`,
+  `reusable-auto-tag`, `reusable-release`). These are skipped **on push**, so
+  the two never race. The nightly pass still fills any gap.
+- **Repositories whose tags follow another scheme** (`@scope/pkg@1.2.3`), so
+  they do not suddenly grow a `v0.1.0`.
+- **Archived repositories, forks, empty repositories, and `sandbox-*` or
+  `archive-*` names.**
+- **Merges before `BACKFILL_SINCE`.**
+- **Any organisation outside `ALLOWED_ORGS`.** nyuchiGOV is outside the
+  enterprise, and an enterprise app cannot be installed there anyway.
+
+`TAGGING_MODE = "dry-run"` (the default) logs the plan and creates nothing.
+
+### Review and triage
+
+Reviews are the Shamwari engine (`shamwari-ai/github-app`, a git dependency
+pinned to a commit), not a copy. The engine is set up to:
+
+- run Workers AI through the `fundi` AI Gateway;
+- skip drafts;
+- comment and never approve;
+- answer only owners, members and collaborators.
+
+This Worker adds the enterprise org allowlist and the `@nyuchi` handle. A team
+mention such as `@nyuchi/platform` does not count as asking.
+
+Triage asks the same model to choose up to three of the repository's existing
+labels. It never creates a label, and never closes, assigns or comments.
+
+No Anthropic API is used anywhere.
+
+## Configuration
+
+Every setting is in `wrangler.toml` `[vars]`, versioned. `wrangler deploy`
+replaces `[vars]`, so a setting made only in the dashboard is lost on the next
+deploy. The kill switches are `TAGGING_MODE`, `REVIEW_ENABLED` and
+`TRIAGE_ENABLED`.
+
+There are two secrets. Both live in the account's **Cloudflare Secrets Store**,
+are bound with `secrets_store_secrets` and are read with `await env.X.get()`:
+
+| Binding              | Secrets Store name              | What                              |
+| -------------------- | ------------------------------- | --------------------------------- |
+| `APP_PRIVATE_KEY`    | `NYUCHI_GITHUB_APP_PRIVATE_KEY` | The App's private key (PEM)       |
+| `APP_WEBHOOK_SECRET` | `NYUCHI_GITHUB_WEBHOOK_SECRET`  | The webhook secret set on the App |
+
+Until both exist, `/webhook` answers 503 and the nightly run logs that the key
+is missing. `GET /` reports whether each secret is bound (true or false, never
+its value).
+
+## Develop
+
+```sh
+npm ci
+npm run build && npm test && npm run check
+scripts/check-policy.sh
+```
+
+To see what the app would tag, without creating anything, use your own token
+from the environment (never in argv):
+
+```sh
+GH_TOKEN="$(gh auth token)" npx tsx scripts/plan.ts nyuchi/api-gateway
+GH_TOKEN="$(gh auth token)" npx tsx scripts/plan.ts --org mukoko-dev
+```
+
+## Deploy
+
+`staging` uploads a preview version. `main` deploys. Both are gated on the
+repository variable `DEPLOY_ENABLED`. The first deploy is made by hand, as
+listed in the owner checklist on nyuchi/.github#90.
+
+The webhook URL is `https://nyuchi-github-app.nyuchi.workers.dev/webhook`.
