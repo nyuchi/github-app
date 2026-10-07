@@ -98,7 +98,7 @@ export async function nightly(
       // A dry run spends what a live run would, so its night is a faithful
       // preview of the live one.
       for (const c of report.channels) {
-        remaining -= live ? c.created.length : c.planned.length;
+        remaining -= live ? (c.charged ?? c.created.length) : c.planned.length;
       }
       remaining = Math.max(0, remaining);
       result.reports.push(report);

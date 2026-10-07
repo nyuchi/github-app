@@ -31,6 +31,7 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test
+      - run: npm run check
       - name: The bundled policy is nyuchi/.github's, unchanged
         run: scripts/check-policy.sh
         env:

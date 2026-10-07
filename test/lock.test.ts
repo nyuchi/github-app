@@ -96,6 +96,9 @@ test("the release ledger persists in the lock's storage, without duplicates", as
     tag,
     object: "o".repeat(40),
     commit: "c".repeat(40),
+    prerelease: false,
+    latest: true,
+    pr: 3,
   });
   await l.add(e("v0.1.0"));
   await l.add(e("v0.1.0"));
@@ -110,7 +113,7 @@ test("the release ledger persists in the lock's storage, without duplicates", as
     ["v0.2.0"],
   );
   // Malformed stored entries are not provenance and are ignored.
-  mem.set("pending-releases-v2", ["v9.9.9", { tag: "v1.0.0" }, e("v0.3.0")]);
+  mem.set("pending-releases-v3", ["v9.9.9", { tag: "v1.0.0" }, e("v0.3.0")]);
   assert.deepEqual(
     (await l.list()).map((x) => x.tag),
     ["v0.3.0"],

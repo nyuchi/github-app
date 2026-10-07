@@ -31,7 +31,7 @@ import {
   planBranch,
   versionTags,
 } from "./tagging";
-import { highest } from "./policy/next-version.mjs";
+import { compare, highest } from "./policy/next-version.mjs";
 
 // ---------------------------------------------------------------------------
 // Queries (shared fragments, so every path validates the same shapes)
@@ -74,7 +74,7 @@ const TREE = `
     entries { name object { __typename ... on Blob { text isBinary isTruncated } } }
   }`;
 
-export const REPO_QUERY = `
+const REPO_QUERY = `
 query Repo($owner: String!, $name: String!, $staging: String!, $hist: Int!, $since: GitTimestamp!, $tagsAfter: String, $wantMain: Boolean!, $wantStaging: Boolean!) {
   repository(owner: $owner, name: $name) {
     isArchived
@@ -251,7 +251,7 @@ export function treeFacts(tree: unknown): WorkflowFacts {
         o.isTruncated === false &&
         typeof o.text === "string";
       return {
-        name: typeof e.name === "string" ? e.name : "",
+        name: e.name,
         // Binary, truncated, a submodule or anything unexpected: unreadable.
         text: readable ? (o.text as string) : null,
       };
@@ -320,6 +320,8 @@ export interface ChannelReport {
   created: string[];
   pending: number;
   note?: string;
+  /** Tags written or possibly written (a lost ref response); for budgets. */
+  charged?: number;
 }
 
 export interface RepoReport {
@@ -337,6 +339,10 @@ export interface LedgerEntry {
   /** The annotated tag object this app created (the provenance). */
   object: string;
   commit: string;
+  /** Decided when the tag was planned; repair reuses them as recorded. */
+  prerelease: boolean;
+  latest: boolean;
+  pr: number | null;
 }
 
 /**
@@ -555,11 +561,15 @@ async function scanChannel(
     entry.note = decision.reason;
     return;
   }
+  if (opts.budget && opts.budget.remaining <= 0) {
+    entry.note = "tonight's tag budget is spent; continues next run";
+    return;
+  }
 
   // Only a protected branch is a release line: its history cannot be
   // rewritten or deleted under the tags.
   if (!(await branchIsProtected(env, token, owner, name, node.name))) {
-    entry.note = `${node.name} has no deletion and non-fast-forward rules; not tagging`;
+    entry.note = `${node.name} lacks deletion, non-fast-forward or linear-history rules; not tagging`;
     return;
   }
 
@@ -582,7 +592,10 @@ async function scanChannel(
   // A merge whose pull request GitHub has not indexed yet looks like a
   // direct push, and would split one rebase merge into several versions.
   // On push, hold; the nightly pass (hours later) tags it.
-  if (opts.trigger === "push" && history.untagged.some((x) => x.pr === null)) {
+  if (
+    opts.trigger === "push" &&
+    history.untagged.some((x) => x.pr === null && !x.foreign)
+  ) {
     entry.note =
       "a new commit's pull request is not indexed yet; the nightly pass tags it";
     return;
@@ -599,13 +612,25 @@ async function scanChannel(
   // The default branch's workflows were checked above. A tag push runs the
   // workflows AT THE TAGGED COMMIT, so every commit about to be tagged is
   // checked too.
-  const publishing = await publishingCommits(
+  const atCommits = await commitFacts(
     env,
     token,
     owner,
     name,
     plan.tags.map((t) => t.commit),
   );
+  const publishing = [...atCommits]
+    .filter(([, f]) => f.publishesOnTag)
+    .map(([oid]) => oid);
+  // On push, a repo that tags this channel itself at THESE commits (a
+  // staging-only reusable-staging-release, say) is tagging them right now.
+  const ownTagger = [...atCommits.values()].some((f) =>
+    channel === "staging" ? f.tagsStaging : f.tagsMain,
+  );
+  if (opts.trigger === "push" && ownTagger) {
+    entry.note = "the repository tags this channel itself";
+    return;
+  }
   if (publishing.length) {
     entry.pending = plan.tags.length + plan.pending;
     entry.note = `a workflow at ${publishing.map((x) => x.slice(0, 7)).join(", ")} starts on tags or releases; an App-made tag would start it`;
@@ -654,7 +679,14 @@ async function scanChannel(
         made,
       );
       object = await createTagObject(env, token, repo, t);
-      await ledger.add({ tag: t.tag, object, commit: t.commit });
+      await ledger.add({
+        tag: t.tag,
+        object,
+        commit: t.commit,
+        prerelease: t.prerelease,
+        latest: t.latest,
+        pr: t.pr,
+      });
     } catch (e) {
       // Stop this branch: the next version depends on this one.
       c.errors.push(`${t.tag}: ${msg(e)}`);
@@ -669,9 +701,11 @@ async function scanChannel(
       // it was written.
       c.errors.push(`${t.tag}: ${msg(e)}`);
       if (opts.budget) opts.budget.remaining--;
+      entry.charged = (entry.charged ?? 0) + 1;
       break;
     }
     if (opts.budget) opts.budget.remaining--;
+    entry.charged = (entry.charged ?? 0) + 1;
     entry.created.push(t.tag);
     const ref: TagRef = {
       name: t.tag,
@@ -697,7 +731,12 @@ async function scanChannel(
   entry.pending = plan.pending + (plan.tags.length - entry.created.length);
 }
 
-/** Does GitHub enforce deletion and non-fast-forward rules on this branch? */
+/**
+ * Is this branch a release line GitHub protects: no deletion, no force-push,
+ * and linear history? Linear history matters as much as the other two: the
+ * walk reads GraphQL history (all ancestors, in date order), which equals
+ * the merge order only when there are no merge commits.
+ */
 export async function branchIsProtected(
   env: Env,
   token: string,
@@ -712,7 +751,13 @@ export async function branchIsProtected(
     const res: GhResponse = await gh(env, token, url);
     if (!Array.isArray(res.body)) return false;
     for (const r of res.body) types.add((r as { type?: unknown }).type);
-    if (types.has("deletion") && types.has("non_fast_forward")) return true;
+    if (
+      types.has("deletion") &&
+      types.has("non_fast_forward") &&
+      types.has("required_linear_history")
+    ) {
+      return true;
+    }
     const m = /<([^>]+)>;\s*rel="next"/.exec(res.headers.get("link") || "");
     url = m ? m[1] : null;
   }
@@ -757,7 +802,6 @@ export async function readHistory(
   commits: Commit[];
   untagged: Commit[];
   incomplete: boolean;
-  stop?: TagRef;
 }> {
   const validPage = (p: HistoryPage | undefined): p is HistoryPage =>
     Boolean(
@@ -804,7 +848,6 @@ export async function readHistory(
     commits,
     untagged: firstTagged < 0 ? commits : commits.slice(0, firstTagged),
     incomplete: !stop && page.pageInfo!.hasNextPage,
-    stop,
   };
 }
 
@@ -813,7 +856,7 @@ export async function readHistory(
 // ---------------------------------------------------------------------------
 
 /** The trailer every tag this app makes carries, and the beta marker. */
-export const TAGGED_BY = "Tagged-by: nyuchi-github-app";
+const TAGGED_BY = "Tagged-by: nyuchi-github-app";
 const STAGING_MARK = "(staging)";
 
 export function tagMessage(
@@ -937,7 +980,21 @@ export async function repairReleases(
 ): Promise<string[]> {
   const pending = await ledger.list();
   if (!pending.length) return [];
+  // Per-repository reads, once.
   const releases = await releaseTags(env, token, owner, name);
+  const protectedBranches: string[] = [];
+  for (const b of branches) {
+    if (await branchIsProtected(env, token, owner, name, b))
+      protectedBranches.push(b);
+  }
+  const facts = await commitFacts(
+    env,
+    token,
+    owner,
+    name,
+    pending.map((e) => e.commit),
+  );
+  const live = versionTags(await allTags(env, token, owner, name), prefix);
   const repaired: string[] = [];
   for (const e of pending) {
     // The ref through REST, which is consistent with this app's own REST
@@ -961,37 +1018,26 @@ export async function repairReleases(
       continue;
     }
     let reachable = false;
-    for (const b of branches) {
-      if (
-        (await branchIsProtected(env, token, owner, name, b)) &&
-        (await onBranch(env, token, owner, name, e.commit, b))
-      ) {
+    for (const b of protectedBranches) {
+      if (await onBranch(env, token, owner, name, e.commit, b)) {
         reachable = true;
         break;
       }
     }
     if (!reachable) continue;
-    if ((await publishingCommits(env, token, owner, name, [e.commit])).length)
-      continue;
-    const live = await allTags(env, token, owner, name);
-    const tag = live.find((t) => t.name === e.tag);
-    if (!tag) continue; // GraphQL has not caught up: next run
-    const prerelease = isStagingTag(tag);
-    // "Latest" is the highest default-branch release; staging betas (plain
-    // x.y.z too) are left out of the comparison.
-    const mainTags = versionTags(live, prefix).filter((t) => !isStagingTag(t));
-    const latest =
-      !prerelease &&
-      highest(
-        mainTags.map((t) => `refs/tags/${t.name}`),
-        prefix,
-      ) === e.tag.slice(prefix.length);
-    const pr = /^Pull-request: #(\d+)$/m.exec(tag.message ?? "");
+    if (facts.get(e.commit)?.publishesOnTag !== false) continue;
+    // Latest only if, as recorded, it was the newest default-branch release
+    // AND no higher non-beta version tag has appeared since.
+    const version = e.tag.slice(prefix.length);
+    const newer = live.some(
+      (t) =>
+        !isStagingTag(t) && compare(t.name.slice(prefix.length), version) > 0,
+    );
     await createRelease(env, token, `${owner}/${name}`, {
       tag: e.tag,
-      prerelease,
-      latest,
-      pr: pr ? Number(pr[1]) : null,
+      prerelease: e.prerelease,
+      latest: e.latest && !e.prerelease && !newer,
+      pr: e.pr,
     });
     await ledger.remove(e.tag);
     repaired.push(e.tag);
@@ -1077,23 +1123,33 @@ export async function allTags(
 }
 
 /**
- * The commits whose own .github/workflows start on tags or releases.
+ * The workflow facts AT each commit (its own .github/workflows).
  *
- * A commit is cleared only when GitHub confirms it is a Commit AND its
+ * A commit gets real facts only when GitHub confirms it is a Commit AND its
  * workflow tree reads cleanly (or confirms there is none). A missing object,
  * a non-Commit object, an unexpected shape, an id that is not a full SHA or
- * an unreadable file all count as publishing.
+ * an unreadable file all give facts that count as publishing.
  */
-export async function publishingCommits(
+export async function commitFacts(
   env: Env,
   token: string,
   owner: string,
   name: string,
   oids: string[],
-): Promise<string[]> {
+): Promise<Map<string, WorkflowFacts>> {
+  const unknown: WorkflowFacts = {
+    tagsStaging: false,
+    tagsMain: false,
+    publishesOnTag: true,
+    unreadable: ["(unverified)"],
+  };
+  const out = new Map<string, WorkflowFacts>();
   const unique = [...new Set(oids)];
-  if (!unique.length) return [];
-  if (unique.some((o) => !/^[0-9a-f]{40}$/i.test(o))) return unique;
+  if (!unique.length) return out;
+  if (unique.some((o) => !/^[0-9a-f]{40}$/i.test(o))) {
+    for (const o of unique) out.set(o, unknown);
+    return out;
+  }
   const fields = unique
     .map(
       (oid, i) =>
@@ -1108,8 +1164,8 @@ export async function publishingCommits(
     { owner, name },
   );
   const repo = data.repository;
-  if (!repo || typeof repo !== "object") return unique;
-  return unique.filter((oid, i) => {
+  unique.forEach((oid, i) => {
+    if (!repo || typeof repo !== "object") return out.set(oid, unknown);
     const commit = repo[`c${i}`] as
       | { __typename?: unknown; oid?: unknown }
       | null
@@ -1118,13 +1174,14 @@ export async function publishingCommits(
       !commit ||
       commit.__typename !== "Commit" ||
       typeof commit.oid !== "string" ||
-      commit.oid.toLowerCase() !== oid.toLowerCase()
+      commit.oid.toLowerCase() !== oid.toLowerCase() ||
+      !(`w${i}` in repo)
     ) {
-      return true;
+      return out.set(oid, unknown);
     }
-    if (!(`w${i}` in repo)) return true;
-    return treeFacts(repo[`w${i}`]).publishesOnTag;
+    out.set(oid, treeFacts(repo[`w${i}`]));
   });
+  return out;
 }
 
 /**

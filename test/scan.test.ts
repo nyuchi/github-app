@@ -172,7 +172,13 @@ function fakeGitHub(opts: FakeOpts) {
       if (method === "GET" && url.includes("/rules/branches/")) {
         return opts.unprotected
           ? { body: [] }
-          : { body: [{ type: "deletion" }, { type: "non_fast_forward" }] };
+          : {
+              body: [
+                { type: "deletion" },
+                { type: "non_fast_forward" },
+                { type: "required_linear_history" },
+              ],
+            };
       }
       if (method === "GET" && url.includes("/compare/")) {
         return { body: { status: opts.compareStatus ?? "ahead" } };
@@ -885,10 +891,18 @@ function memLedger(initial: LedgerEntry[] = []) {
     },
   };
 }
-const entry = (tag: string, commit: string): LedgerEntry => ({
+const entry = (
+  tag: string,
+  commit: string,
+  extra: Partial<LedgerEntry> = {},
+): LedgerEntry => ({
   tag,
   object: O(tag),
   commit,
+  prerelease: false,
+  latest: true,
+  pr: null,
+  ...extra,
 });
 
 test("a failed release is recorded in the ledger, then repaired on the next run", async () => {
@@ -991,7 +1005,9 @@ test("release repair: an existing release, drafts included, clears the ledger wi
 });
 
 test("release repair: channel comes from the tag; staging betas do not take 'latest' from main", async () => {
-  const ledger = memLedger([entry("v1.2.5", H("m3"))]);
+  const ledger = memLedger([
+    entry("v1.2.5", H("m3"), { prerelease: true, latest: false }),
+  ]);
   const fake = fakeGitHub({
     tags: [
       { name: "v1.2.5", commit: H("m3"), message: APP_MSG("v1.2.5", true) },
@@ -1240,7 +1256,10 @@ test("provenance: an unprotected branch is not a release line", async () => {
     const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", live());
     assert.equal(writes(m.calls).length, 0);
     for (const c of r.channels)
-      assert.match(c.note ?? "", /no deletion and non-fast-forward rules/);
+      assert.match(
+        c.note ?? "",
+        /lacks deletion, non-fast-forward or linear-history rules/,
+      );
   } finally {
     m.restore();
   }
@@ -1300,8 +1319,8 @@ test("provenance: a ledger tag deleted and re-made by someone else is not repair
 });
 
 test("provenance: a ref the GraphQL index has not caught up with is still found (REST)", async () => {
-  // The ref exists (REST) but the GraphQL tag list lags: the ledger entry
-  // must NOT be dropped; it waits for the next run.
+  // The ref exists (REST) but the GraphQL tag list lags: the entry must
+  // not be dropped, and REST is enough to repair it.
   const ledger = memLedger([entry("v0.4.0", H("m3"))]);
   const fake = fakeGitHub({
     tags: [{ name: "v0.3.0", commit: H("m3") }],
@@ -1316,7 +1335,12 @@ test("provenance: a ref the GraphQL index has not caught up with is still found 
   });
   try {
     await scanRepo(testEnv(), "tok", "nyuchi", "x", live({ ledger }));
-    assert.deepEqual(ledger.pending, ["v0.4.0"]);
+    // Found through REST and repaired, though GraphQL does not list it.
+    assert.deepEqual(ledger.pending, []);
+    const rel = m.calls.find(
+      (c) => c.method === "POST" && c.url.endsWith("/releases"),
+    )!;
+    assert.equal((rel.body as { tag_name: string }).tag_name, "v0.4.0");
   } finally {
     m.restore();
   }
@@ -1388,6 +1412,133 @@ test("provenance: a live run without the release ledger writes nothing", async (
     });
     assert.match(r.skipped ?? "", /ledger/);
     assert.equal(m.calls.length, 0);
+  } finally {
+    m.restore();
+  }
+});
+
+// ---- Full-review round: linear history, own tagger at commits, budgets ----
+
+test("a branch without linear history is not a release line (history order = merge order)", async () => {
+  const fake = fakeGitHub({
+    tags: [{ name: "v0.0.9", commit: H("s4") }],
+    repo: { staging: null },
+  });
+  const m = mockFetch((method, url, body) =>
+    method === "GET" && url.includes("/rules/branches/")
+      ? { body: [{ type: "deletion" }, { type: "non_fast_forward" }] }
+      : fake.route(method, url, body),
+  );
+  try {
+    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", live());
+    assert.equal(writes(m.calls).length, 0);
+    assert.match(r.channels[0].note ?? "", /linear-history/);
+  } finally {
+    m.restore();
+  }
+});
+
+test("a back-merged (foreign) commit does not hold push tagging", async () => {
+  const { m } = withFake({
+    tags: [{ name: "v0.0.9", commit: H("s4") }],
+    repo: {
+      staging: null,
+      defaultBranchRef: {
+        name: "main",
+        target: {
+          history: {
+            pageInfo: { hasNextPage: false },
+            nodes: [
+              node("m2", 20),
+              node("hotfix", 9, "release-x"),
+              node("m1", 10),
+            ],
+          },
+        },
+      },
+    },
+  });
+  try {
+    const r = await scanRepo(
+      testEnv(),
+      "tok",
+      "nyuchi",
+      "x",
+      live({ trigger: "push", only: "main" }),
+    );
+    assert.doesNotMatch(r.channels[0].note ?? "", /not indexed/);
+    assert.deepEqual(r.channels[0].created, ["v0.1.0", "v0.2.0"]);
+  } finally {
+    m.restore();
+  }
+});
+
+test("on push, a repo whose own staging tagger exists only at the planned commits is left to it", async () => {
+  const { m } = withFake({
+    tags: [{ name: "v0.0.9", commit: H("s4") }],
+    repo: { workflows: tree() }, // HEAD (main) has no tagger...
+    workflowsAt: { s5: [STAGING_WORKFLOW] }, // ...but staging's commit has one
+  });
+  try {
+    const r = await scanRepo(
+      testEnv(),
+      "tok",
+      "nyuchi",
+      "x",
+      live({ trigger: "push", only: "staging" }),
+    );
+    assert.equal(writes(m.calls).length, 0);
+    assert.match(r.channels[0].note ?? "", /tags this channel itself/);
+  } finally {
+    m.restore();
+  }
+});
+
+test("a lost ref response is charged to the budget and reported as charged", async () => {
+  const fake = fakeGitHub({
+    tags: [{ name: "v0.0.9", commit: H("s4") }],
+    repo: { staging: null },
+  });
+  const m = mockFetch((method, url, body) => {
+    if (method === "POST" && url.endsWith("/git/refs")) {
+      fake.route(method, url, body);
+      return { status: 504, body: { message: "Gateway Timeout" } };
+    }
+    if (method === "GET" && url.includes("/releases?"))
+      return { body: [{ tag_name: "v0.1.0" }] };
+    return fake.route(method, url, body);
+  });
+  try {
+    const budget = { remaining: 5 };
+    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", live({ budget }));
+    assert.deepEqual(r.channels[0].created, []);
+    assert.equal(r.channels[0].charged, 1);
+    assert.equal(budget.remaining, 4);
+  } finally {
+    m.restore();
+  }
+});
+
+test("with the budget spent, a channel is not even read", async () => {
+  const { m } = withFake({
+    tags: [{ name: "v0.0.9", commit: H("s4") }],
+    repo: { staging: null },
+  });
+  try {
+    const r = await scanRepo(
+      testEnv(),
+      "tok",
+      "nyuchi",
+      "x",
+      live({ budget: { remaining: 0 } }),
+    );
+    assert.match(r.channels[0].note ?? "", /budget is spent/);
+    assert.equal(
+      m.calls.filter(
+        (c) => c.url.includes("/rules/") || c.url.includes("/compare/"),
+      ).length,
+      0,
+    );
   } finally {
     m.restore();
   }

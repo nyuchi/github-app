@@ -60,7 +60,8 @@ This Worker only decides **which commits are releases**:
   already exists.
 
 - Tags only commits that GitHub reports on a **protected** branch (one with
-  deletion and non-fast-forward rules), read with the app's own
+  deletion, non-fast-forward and linear-history rules; linear history makes
+  the history the walk reads equal the merge order), read with the app's own
   authenticated calls. Immediately before the write, the commit is proved
   reachable from that branch's head again. A webhook payload only says which
   repository and which channel to look at.

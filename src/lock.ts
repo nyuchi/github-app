@@ -100,7 +100,7 @@ export interface KV {
 
 /** The release ledger kept in the repository's own Durable Object storage. */
 export function storageLedger(storage: KV): ReleaseLedger {
-  const KEY = "pending-releases-v2";
+  const KEY = "pending-releases-v3";
   const read = async (): Promise<LedgerEntry[]> => {
     const v = await storage.get<unknown>(KEY);
     if (!Array.isArray(v)) return [];
@@ -110,7 +110,11 @@ export function storageLedger(storage: KV): ReleaseLedger {
         !!e &&
         typeof (e as LedgerEntry).tag === "string" &&
         typeof (e as LedgerEntry).object === "string" &&
-        typeof (e as LedgerEntry).commit === "string",
+        typeof (e as LedgerEntry).commit === "string" &&
+        typeof (e as LedgerEntry).prerelease === "boolean" &&
+        typeof (e as LedgerEntry).latest === "boolean" &&
+        ((e as LedgerEntry).pr === null ||
+          Number.isSafeInteger((e as LedgerEntry).pr)),
     );
   };
   return {
