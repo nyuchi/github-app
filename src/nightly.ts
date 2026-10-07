@@ -13,6 +13,7 @@ import { scanLocked, type TagLockNamespace } from "./lock";
 import { intSetting, maxPerRepo, type RepoReport } from "./scan";
 
 interface Repo {
+  id: number;
   name: string;
   owner: { login: string };
   archived?: boolean;
@@ -91,6 +92,7 @@ export async function nightly(
         token,
         owner: repo.owner.login,
         name: repo.name,
+        repoId: repo.id,
         opts: { trigger: "nightly", live, maxTags: remaining },
       });
       // A dry run spends what a live run would, so its night is a faithful

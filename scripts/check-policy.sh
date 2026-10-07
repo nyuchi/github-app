@@ -46,4 +46,28 @@ done <<'REQUIRED'
 src/policy/next-version.mjs .github/actions/next-version/next-version.mjs
 src/policy/version-fixtures.json .github/actions/next-version/version-fixtures.json
 REQUIRED
+# And the pinned commit must be on nyuchi/.github's own staging or main.
+# raw.githubusercontent.com serves any commit in the fork network under the
+# parent's name, so the URL alone does not prove the commit is ours.
+api() {
+  if [ -n "${GH_TOKEN:-}" ]; then
+    curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" "$1"
+  else
+    curl -fsSL "$1"
+  fi
+}
+for sha in $(awk '$1 == "nyuchi/.github" { print $2 }' src/policy/POLICY_SOURCE | sort -u); do
+  ok=""
+  for branch in staging main; do
+    st="$(api "https://api.github.com/repos/nyuchi/.github/compare/${sha}...${branch}" \
+      | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{console.log(JSON.parse(s).status||"")}catch{console.log("")}})' || true)"
+    if [ "$st" = "ahead" ] || [ "$st" = "identical" ]; then ok="$branch"; break; fi
+  done
+  if [ -z "$ok" ]; then
+    echo "::error::POLICY_SOURCE pins ${sha}, which is not on nyuchi/.github staging or main." >&2
+    status=1
+  else
+    echo "Pinned commit ${sha:0:12} is on nyuchi/.github ${ok}."
+  fi
+done
 exit "$status"

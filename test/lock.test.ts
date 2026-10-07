@@ -53,7 +53,7 @@ test("a LIVE run without the per-repository lock is refused (fail closed)", asyn
   );
 });
 
-test("runs for one repository share one lock instance; names are case-insensitive", async () => {
+test("runs for one repository share one lock instance, keyed by repository id (renames do not split it)", async () => {
   const seen: string[] = [];
   const ns = {
     idFromName: (n: string) => n,
@@ -69,15 +69,17 @@ test("runs for one repository share one lock instance; names are case-insensitiv
     token: "t",
     owner: "Nyuchi",
     name: "API",
+    repoId: 7,
     opts: { trigger: "push", live: true },
   });
   await scanLocked(env, {
     token: "t",
     owner: "nyuchi",
-    name: "api",
+    name: "api-renamed",
+    repoId: 7,
     opts: { trigger: "nightly", live: true },
   });
-  assert.deepEqual(seen, ["nyuchi/api", "nyuchi/api"]);
+  assert.deepEqual(seen, ["repo-7", "repo-7"]);
 });
 
 import { storageLedger } from "../src/lock";
@@ -112,5 +114,23 @@ test("the release ledger persists in the lock's storage, without duplicates", as
   assert.deepEqual(
     (await l.list()).map((x) => x.tag),
     ["v0.3.0"],
+  );
+});
+
+test("a live run without a repository id is refused (no lock key)", async () => {
+  const ns = {
+    idFromName: (n: string) => n,
+    get: () => ({
+      scan: async () => ({ repo: "x", channels: [], errors: [] }),
+    }),
+  };
+  await assert.rejects(
+    scanLocked(testEnv({ TAG_LOCK: ns }), {
+      token: "t",
+      owner: "o",
+      name: "r",
+      opts: { trigger: "push", live: true },
+    }),
+    /no repository id/,
   );
 });

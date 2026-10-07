@@ -33,5 +33,7 @@ jobs:
       - run: npm test
       - name: The bundled policy is nyuchi/.github's, unchanged
         run: scripts/check-policy.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
       - name: The Worker bundles
         run: npx wrangler deploy --dry-run --outdir "$RUNNER_TEMP/bundle"

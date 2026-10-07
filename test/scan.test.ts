@@ -67,6 +67,8 @@ interface FakeOpts {
   releaseExists?: boolean;
   /** The branch has no deletion/non-fast-forward rules. */
   unprotected?: boolean;
+  /** Override the tag object a REST ref read reports, per tag name. */
+  refObject?: Record<string, string>;
 }
 
 /**
@@ -155,6 +157,17 @@ function fakeGitHub(opts: FakeOpts) {
           repository[m[1]] = name ? tree(...opts.workflowsAt![name]) : null;
         }
         return { body: { data: { repository } } };
+      }
+      if (method === "GET" && url.includes("/git/ref/tags/")) {
+        const name = decodeURIComponent(url.split("/git/ref/tags/")[1]);
+        const t = tags.find((x) => x.name === name);
+        return t
+          ? {
+              body: {
+                object: { type: "tag", sha: opts.refObject?.[name] ?? O(name) },
+              },
+            }
+          : { status: 404, body: { message: "Not Found" } };
       }
       if (method === "GET" && url.includes("/rules/branches/")) {
         return opts.unprotected
@@ -1262,27 +1275,17 @@ test("provenance: tags are annotated, carry the merging PR, and the release link
 
 test("provenance: a ledger tag deleted and re-made by someone else is not repaired", async () => {
   const ledger = memLedger([entry("v0.3.0", H("m3"))]);
-  // The live v0.3.0 is a different tag object (someone else's), same name.
   const fake = fakeGitHub({
     tags: [{ name: "v0.3.0", commit: H("m3") }],
     repo: { staging: null, workflows: tree() },
+    // The live ref now names a different tag object: someone else's.
+    refObject: { "v0.3.0": H("someone-else") },
   });
-  const m = mockFetch((method, url, body) => {
-    const res = fake.route(method, url, body) as {
-      body: {
-        data?: {
-          repository?: { tags?: { nodes: { target: { oid: string } }[] } };
-        };
-      };
-    };
-    const q = (body as { query?: string } | undefined)?.query ?? "";
-    if (q.includes("query Repo(") || q.includes("query Tags(")) {
-      for (const n of res.body.data?.repository?.tags?.nodes ?? [])
-        n.target.oid = H("someone-else");
-    }
-    if (method === "GET" && url.includes("/releases?")) return { body: [] };
-    return res;
-  });
+  const m = mockFetch((method, url, body) =>
+    method === "GET" && url.includes("/releases?")
+      ? { body: [] }
+      : fake.route(method, url, body),
+  );
   try {
     await scanRepo(testEnv(), "tok", "nyuchi", "x", live({ ledger }));
     assert.equal(
@@ -1294,6 +1297,42 @@ test("provenance: a ledger tag deleted and re-made by someone else is not repair
   } finally {
     m.restore();
   }
+});
+
+test("provenance: a ref the GraphQL index has not caught up with is still found (REST)", async () => {
+  // The ref exists (REST) but the GraphQL tag list lags: the ledger entry
+  // must NOT be dropped; it waits for the next run.
+  const ledger = memLedger([entry("v0.4.0", H("m3"))]);
+  const fake = fakeGitHub({
+    tags: [{ name: "v0.3.0", commit: H("m3") }],
+    repo: { staging: null, workflows: tree() },
+  });
+  const m = mockFetch((method, url, body) => {
+    if (method === "GET" && url.includes("/git/ref/tags/v0.4.0")) {
+      return { body: { object: { type: "tag", sha: O("v0.4.0") } } };
+    }
+    if (method === "GET" && url.includes("/releases?")) return { body: [] };
+    return fake.route(method, url, body);
+  });
+  try {
+    await scanRepo(testEnv(), "tok", "nyuchi", "x", live({ ledger }));
+    assert.deepEqual(ledger.pending, ["v0.4.0"]);
+  } finally {
+    m.restore();
+  }
+});
+
+test("a commit merged into another branch (a back-merge) is not a release of this one", () => {
+  const commits = toCommits({ name: "staging" }, [
+    node("backmerged", 30, "main"),
+    node("feature", 31, "staging"),
+  ]);
+  assert.deepEqual(commits[0], {
+    oid: H("backmerged"),
+    pr: null,
+    foreign: true,
+  });
+  assert.deepEqual(commits[1], { oid: H("feature"), pr: 31 });
 });
 
 test("provenance: write-ahead ledger; a lost ref response is repaired later, never lost", async () => {

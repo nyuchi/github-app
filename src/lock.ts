@@ -35,6 +35,11 @@ export interface ScanRequest {
   token: string;
   owner: string;
   name: string;
+  /**
+   * The repository's numeric id. The lock and its release ledger are keyed
+   * by it, not by owner/name, which a rename or transfer changes.
+   */
+  repoId?: number;
   opts: Omit<ScanOptions, "budget" | "ledger"> & { maxTags?: number };
 }
 
@@ -54,15 +59,20 @@ export async function scanLocked(
   env: Env & { TAG_LOCK?: TagLockNamespace },
   req: ScanRequest,
 ): Promise<RepoReport> {
-  if (env.TAG_LOCK) {
-    const id = env.TAG_LOCK.idFromName(
-      `${req.owner}/${req.name}`.toLowerCase(),
-    );
-    return env.TAG_LOCK.get(id).scan(req);
+  const id = req.repoId;
+  if (
+    env.TAG_LOCK &&
+    typeof id === "number" &&
+    Number.isSafeInteger(id) &&
+    id > 0
+  ) {
+    return env.TAG_LOCK.get(env.TAG_LOCK.idFromName(`repo-${id}`)).scan(req);
   }
   if (req.opts.live) {
     throw new Error(
-      "TAG_LOCK is not bound; refusing to tag without the per-repository lock",
+      env.TAG_LOCK
+        ? "no repository id; refusing to tag without the per-repository lock"
+        : "TAG_LOCK is not bound; refusing to tag without the per-repository lock",
     );
   }
   return runScan(env, req);

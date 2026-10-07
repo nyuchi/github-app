@@ -295,3 +295,22 @@ test("review: on: is an allowlist; an unknown or misspelt event counts as publis
   );
   assert.equal(startsOnTagOrRelease("workflow_dispatch"), false);
 });
+
+test("foreign (back-merged) commits are skipped, never tagged on this branch", () => {
+  const plan = planBranch({
+    channel: "staging",
+    history: [
+      { oid: "f2", pr: 9 },
+      { oid: "bm", pr: null, foreign: true },
+      { oid: "f1", pr: 8 },
+    ],
+    tags: [{ name: "v0.1.0", commit: "zz" }],
+  });
+  assert.deepEqual(
+    plan.tags.map((t) => [t.tag, t.commit]),
+    [
+      ["v0.1.1", "f1"],
+      ["v0.1.2", "f2"],
+    ],
+  );
+});

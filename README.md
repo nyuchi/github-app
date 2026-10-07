@@ -37,9 +37,11 @@ This Worker only decides **which commits are releases**:
 
 - For each branch it walks back from the head to the first commit that already
   carries a `v<semver>` tag. Every commit after that is unreleased.
-- Unreleased commits are grouped by the pull request that merged them. A rebase
-  merge is one release, tagged on its newest commit. A commit with no pull
-  request is a release on its own.
+- Unreleased commits are grouped by the pull request that merged them into
+  **this** branch. A rebase merge is one release, tagged on its newest commit.
+  A commit with no pull request is a release on its own. A commit that came
+  through a pull request into another branch (a back-merge of main into
+  staging, say) is not a release of this branch and is never tagged on it.
 - Releases are tagged oldest first, each at the next version above the highest
   existing tag. Only the newest default-branch release is marked "latest".
 - At most `BACKFILL_MAX_PER_REPO` tags per repository per run, and
@@ -72,8 +74,8 @@ This Worker only decides **which commits are releases**:
   recorded and its commit is still on a protected branch. A tag deleted and
   re-made by anyone else is never touched.
 - One tagging run per repository at a time. Every run, push or nightly, goes
-  through a Durable Object (`TagLock`, named after the repository) and runs
-  under its lock. Two runs can therefore never put two different versions on
+  through a Durable Object (`TagLock`) keyed by the repository's numeric id,
+  so a rename cannot split it, and runs under its lock. Two runs can therefore never put two different versions on
   one commit. A live run refuses to start without the lock.
 - **Fail closed** on anything unverified:
   - an unset or unparseable `BACKFILL_SINCE`;

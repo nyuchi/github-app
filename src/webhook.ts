@@ -40,6 +40,7 @@ export type PushDecision =
       name: string;
       channel: Channel;
       installation: number;
+      repoId: number;
     }
   | { run: "skip"; reason: string };
 
@@ -58,7 +59,8 @@ export function decidePush(
   const defaultBranch =
     typeof repo.default_branch === "string" ? repo.default_branch : "";
   const installation = (p.installation as { id?: number } | undefined)?.id;
-  if (!ownerLogin || !name || !installation) {
+  const repoId = typeof repo.id === "number" ? repo.id : NaN;
+  if (!ownerLogin || !name || !installation || !Number.isSafeInteger(repoId)) {
     return {
       run: "skip",
       reason: "payload missing repository or installation",
@@ -68,7 +70,7 @@ export function decidePush(
   if (defaultBranch && ref === `refs/heads/${defaultBranch}`) channel = "main";
   else if (ref === `refs/heads/${stagingName}`) channel = "staging";
   else return { run: "skip", reason: `ref not released: ${ref || "(none)"}` };
-  return { run: "tag", owner: ownerLogin, name, channel, installation };
+  return { run: "tag", owner: ownerLogin, name, channel, installation, repoId };
 }
 
 /**
@@ -224,6 +226,7 @@ async function runTagging(
       token,
       owner: d.owner,
       name: d.name,
+      repoId: d.repoId,
       opts: {
         trigger: "push",
         only: d.channel,

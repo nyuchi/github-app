@@ -75,14 +75,14 @@ const TREE = `
   }`;
 
 export const REPO_QUERY = `
-query Repo($owner: String!, $name: String!, $staging: String!, $hist: Int!, $since: GitTimestamp!, $tagsAfter: String) {
+query Repo($owner: String!, $name: String!, $staging: String!, $hist: Int!, $since: GitTimestamp!, $tagsAfter: String, $wantMain: Boolean!, $wantStaging: Boolean!) {
   repository(owner: $owner, name: $name) {
     isArchived
     isFork
     isEmpty
     isDisabled
-    defaultBranchRef { name ${HISTORY} }
-    staging: ref(qualifiedName: $staging) { name ${HISTORY} }
+    defaultBranchRef { name ...@include(if: $wantMain) { ${HISTORY} } }
+    staging: ref(qualifiedName: $staging) @include(if: $wantStaging) { name ${HISTORY} }
     tags: refs(refPrefix: "refs/tags/", first: 100, after: $tagsAfter) { ${TAG_PAGE} }
     workflows: object(expression: "HEAD:.github/workflows") { ${TREE} }
   }
@@ -240,6 +240,10 @@ export function treeFacts(tree: unknown): WorkflowFacts {
       }[]
     ).map((e) => {
       const o = e.object;
+      if (typeof e.name !== "string" || !e.name) {
+        // An entry without a name cannot be judged: count it as publishing.
+        return { name: "unnamed.yml", text: null };
+      }
       const readable =
         o &&
         o.__typename === "Blob" &&
@@ -293,11 +297,15 @@ export function toCommits(
 ): Commit[] {
   const branch = b?.name;
   return nodes.map((n) => {
-    const prs = n.associatedPullRequests?.nodes ?? [];
-    const pr =
-      prs.find((p) => p.merged && p.baseRefName === branch) ??
-      prs.find((p) => p.merged);
-    return { oid: n.oid, pr: pr ? pr.number : null };
+    const merged = (n.associatedPullRequests?.nodes ?? []).filter(
+      (p) => p.merged,
+    );
+    const here = merged.find((p) => p.baseRefName === branch);
+    if (here) return { oid: n.oid, pr: here.number };
+    // Merged only into other branches: it reached this branch some other
+    // way (a back-merge), so it is not a release of this branch.
+    if (merged.length) return { oid: n.oid, pr: null, foreign: true };
+    return { oid: n.oid, pr: null };
   });
 }
 
@@ -432,6 +440,8 @@ async function scanInner(
     hist,
     since,
     tagsAfter: null,
+    wantMain: opts.only !== "staging",
+    wantStaging: opts.only !== "main",
   });
   const r = data.repository;
   if (!r || typeof r !== "object") {
@@ -507,7 +517,6 @@ async function scanInner(
         token,
         owner,
         name,
-        tags,
         prefix,
         opts.ledger,
         protectedBranches,
@@ -696,14 +705,18 @@ export async function branchIsProtected(
   name: string,
   branch: string,
 ): Promise<boolean> {
-  const { body } = await gh(
-    env,
-    token,
-    `/repos/${owner}/${name}/rules/branches/${encodeURIComponent(branch)}`,
-  );
-  if (!Array.isArray(body)) return false;
-  const types = new Set(body.map((r) => (r as { type?: unknown }).type));
-  return types.has("deletion") && types.has("non_fast_forward");
+  const types = new Set<unknown>();
+  let url: string | null =
+    `/repos/${owner}/${name}/rules/branches/${encodeURIComponent(branch)}?per_page=100`;
+  for (let i = 0; url && i < 5; i++) {
+    const res: GhResponse = await gh(env, token, url);
+    if (!Array.isArray(res.body)) return false;
+    for (const r of res.body) types.add((r as { type?: unknown }).type);
+    if (types.has("deletion") && types.has("non_fast_forward")) return true;
+    const m = /<([^>]+)>;\s*rel="next"/.exec(res.headers.get("link") || "");
+    url = m ? m[1] : null;
+  }
+  return false;
 }
 
 /** Is `commit` the head of `branch` or an ancestor of it? */
@@ -918,34 +931,32 @@ export async function repairReleases(
   token: string,
   owner: string,
   name: string,
-  tags: TagRef[],
   prefix: string,
   ledger: ReleaseLedger,
   branches: string[],
 ): Promise<string[]> {
   const pending = await ledger.list();
   if (!pending.length) return [];
-  // A fresh read: the run's in-memory list may miss a ref whose creation
-  // response was lost, and that is exactly the tag this must find.
-  void tags;
-  const live = await allTags(env, token, owner, name);
   const releases = await releaseTags(env, token, owner, name);
-  const vt = versionTags(live, prefix);
-  const mainTags = vt.filter((t) => !isStagingTag(t));
   const repaired: string[] = [];
   for (const e of pending) {
-    const tag = vt.find((t) => t.name === e.tag);
-    if (
-      !tag ||
-      tag.unresolved ||
-      tag.object !== e.object ||
-      tag.commit !== e.commit
-    ) {
+    // The ref through REST, which is consistent with this app's own REST
+    // writes (a GraphQL read may lag behind them).
+    const ref = await tagRef(env, token, owner, name, e.tag);
+    if (ref === "absent") {
+      await ledger.remove(e.tag); // never created, or deleted: nothing to do
+      continue;
+    }
+    if (ref === null) continue; // unknown: try again later
+    if (ref.type !== "tag" || ref.sha !== e.object) {
+      // Re-made by someone else (a different object), even under our name.
       await ledger.remove(e.tag);
       continue;
     }
-    if (releases === null) continue; // unknown: try again later
-    if (releases.has(tag.name)) {
+    // A tag object's sha is the hash of its content, so the recorded object
+    // still names the recorded commit.
+    if (releases === null) continue;
+    if (releases.has(e.tag)) {
       await ledger.remove(e.tag);
       continue;
     }
@@ -953,35 +964,66 @@ export async function repairReleases(
     for (const b of branches) {
       if (
         (await branchIsProtected(env, token, owner, name, b)) &&
-        (await onBranch(env, token, owner, name, tag.commit, b))
+        (await onBranch(env, token, owner, name, e.commit, b))
       ) {
         reachable = true;
         break;
       }
     }
     if (!reachable) continue;
-    if ((await publishingCommits(env, token, owner, name, [tag.commit])).length)
+    if ((await publishingCommits(env, token, owner, name, [e.commit])).length)
       continue;
+    const live = await allTags(env, token, owner, name);
+    const tag = live.find((t) => t.name === e.tag);
+    if (!tag) continue; // GraphQL has not caught up: next run
     const prerelease = isStagingTag(tag);
     // "Latest" is the highest default-branch release; staging betas (plain
     // x.y.z too) are left out of the comparison.
+    const mainTags = versionTags(live, prefix).filter((t) => !isStagingTag(t));
     const latest =
       !prerelease &&
       highest(
         mainTags.map((t) => `refs/tags/${t.name}`),
         prefix,
-      ) === tag.name.slice(prefix.length);
+      ) === e.tag.slice(prefix.length);
     const pr = /^Pull-request: #(\d+)$/m.exec(tag.message ?? "");
     await createRelease(env, token, `${owner}/${name}`, {
-      tag: tag.name,
+      tag: e.tag,
       prerelease,
       latest,
       pr: pr ? Number(pr[1]) : null,
     });
     await ledger.remove(e.tag);
-    repaired.push(tag.name);
+    repaired.push(e.tag);
   }
   return repaired;
+}
+
+/**
+ * A tag ref through REST: its object, "absent" on a 404, or null when the
+ * answer has an unexpected shape.
+ */
+async function tagRef(
+  env: Env,
+  token: string,
+  owner: string,
+  name: string,
+  tag: string,
+): Promise<{ type: string; sha: string } | "absent" | null> {
+  try {
+    const { body } = await gh(
+      env,
+      token,
+      `/repos/${owner}/${name}/git/ref/tags/${encodeURIComponent(tag)}`,
+    );
+    const o = (body as { object?: { type?: unknown; sha?: unknown } } | null)
+      ?.object;
+    if (typeof o?.type !== "string" || typeof o.sha !== "string") return null;
+    return { type: o.type, sha: o.sha };
+  } catch (e) {
+    if (e instanceof AppError && e.status === 404) return "absent";
+    throw e;
+  }
 }
 
 /** Every tag of the repository, peeled, starting from an already-read page. */

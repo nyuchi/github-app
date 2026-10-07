@@ -26,8 +26,14 @@ export type Channel = "staging" | "main";
 
 export interface Commit {
   oid: string;
-  /** Pull request that merged this commit into the branch, if GitHub knows one. */
+  /** Pull request that merged this commit into THIS branch, if GitHub knows one. */
   pr: number | null;
+  /**
+   * The commit arrived through a pull request merged into ANOTHER branch
+   * (a back-merge of main into staging, say). It is not a release of this
+   * branch: it is never tagged here and never opens a release group.
+   */
+  foreign?: boolean;
 }
 
 export interface TagRef {
@@ -108,11 +114,11 @@ export function planBranch(input: {
   const max = Math.max(0, input.max ?? 10);
   const vtags = versionTags(input.tags, prefix);
   const tagged = new Set(vtags.map((t) => t.commit));
-  const names = new Set(input.tags.map((t) => t.name));
 
   const untagged: Commit[] = [];
   for (const c of input.history) {
     if (tagged.has(c.oid)) break;
+    if (c.foreign) continue;
     untagged.push(c);
   }
   if (untagged.length === 0) return { tags: [], pending: 0 };
@@ -141,10 +147,6 @@ export function planBranch(input: {
     let version: string;
     try {
       version = nextVersion(current, { channel: input.channel });
-      // Never reuse a name, even a pre-release one highest() skipped.
-      while (names.has(prefix + version)) {
-        version = nextVersion(version, { channel: input.channel });
-      }
     } catch (e) {
       if (e instanceof PolicyError) {
         return {
@@ -155,7 +157,6 @@ export function planBranch(input: {
       }
       throw e;
     }
-    names.add(prefix + version);
     out.push({
       tag: prefix + version,
       version,

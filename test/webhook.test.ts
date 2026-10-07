@@ -9,6 +9,7 @@ const push = (ref: string, over: Record<string, unknown> = {}) => ({
   deleted: false,
   installation: { id: 77 },
   repository: {
+    id: 4242,
     name: "lic",
     default_branch: "main",
     owner: { login: "nyuchi" },
@@ -35,6 +36,7 @@ test("push to the default branch is MINOR, to staging PATCH, anything else nothi
     name: "lic",
     channel: "main",
     installation: 77,
+    repoId: 4242,
   });
   assert.equal(
     (decidePush(push("refs/heads/staging")) as { channel: string }).channel,
