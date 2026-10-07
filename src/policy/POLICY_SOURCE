@@ -1,0 +1,2 @@
+nyuchi/.github 93d089f93edecaba6ea43dc84e664d66c142fe79 .github/actions/next-version/next-version.mjs src/policy/next-version.mjs
+nyuchi/.github 93d089f93edecaba6ea43dc84e664d66c142fe79 .github/actions/next-version/version-fixtures.json src/policy/version-fixtures.json
