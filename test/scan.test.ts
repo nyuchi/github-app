@@ -1635,7 +1635,7 @@ test("night: a PR-less commit that arrived within the hour holds the channel; an
   }
 });
 
-test("repair: transient failures never count; a permanent one is dropped after bounded runs", async () => {
+test("repair: transient failures are counted separately (loosely); a permanent one is dropped after bounded runs", async () => {
   const run = async (status: number, attempts: number) => {
     const ledger = memLedger([entry("v0.3.0", H("m3"), { attempts })]);
     const fake = fakeGitHub({
@@ -1665,13 +1665,18 @@ test("repair: transient failures never count; a permanent one is dropped after b
     }
   };
   const transient = await run(502, 9);
-  assert.equal(transient.ledger[0]?.attempts, 9, "a 5xx does not count");
+  assert.equal(transient.ledger[0]?.attempts, 9, "a 5xx is not a stuck run");
+  assert.equal(transient.ledger[0]?.transient, 1, "...it is a transient one");
   assert.match(transient.errors, /will retry/);
   const limited = await run(403, 9);
-  assert.equal(limited.ledger[0]?.attempts, 9, "a rate limit does not count");
+  assert.equal(
+    limited.ledger[0]?.attempts,
+    9,
+    "a rate limit is not a stuck run",
+  );
   const permanent = await run(422, 9);
   assert.deepEqual(permanent.ledger, []);
-  assert.match(permanent.errors, /giving up after 10 runs/);
+  assert.match(permanent.errors, /giving up after 10 stuck runs/);
 });
 
 test("repair: one entry's failure does not block the others", async () => {
@@ -1813,4 +1818,71 @@ test("repair: a 403 that is not a rate limit (no permission) counts as stuck", a
   } finally {
     m.restore();
   }
+});
+
+test("repair: GitHub failing for a month (transient) is eventually given up and reported", async () => {
+  const ledger = memLedger([entry("v0.3.0", H("m3"), { transient: 29 })]);
+  const fake = fakeGitHub({
+    tags: [{ name: "v0.3.0", commit: H("m3") }],
+    repo: { staging: null, workflows: tree() },
+  });
+  const m = mockFetch((method, url, body) =>
+    method === "POST" && url.endsWith("/releases")
+      ? { status: 502, body: { message: "Bad Gateway" } }
+      : fake.route(method, url, body),
+  );
+  try {
+    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", live({ ledger }));
+    assert.deepEqual(await ledger.list(), []);
+    assert.match(r.errors.join(" "), /giving up after 30 failed runs/);
+  } finally {
+    m.restore();
+  }
+});
+
+test("night: a record that cannot place an old head (an import) does not hold forever", async () => {
+  const old = "2026-01-01T00:00:00Z";
+  const { m } = withFake({
+    tags: [{ name: "v0.0.9", commit: H("s4") }],
+    activity: [],
+    repo: {
+      staging: null,
+      defaultBranchRef: {
+        name: "main",
+        target: {
+          history: {
+            pageInfo: { hasNextPage: false },
+            nodes: [
+              { ...node("direct", null), committedDate: old },
+              node("m1", 10),
+            ],
+          },
+        },
+      },
+    },
+  });
+  try {
+    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", live());
+    assert.deepEqual(r.channels[0].created, ["v0.1.0", "v0.2.0"]);
+  } finally {
+    m.restore();
+  }
+});
+
+test("a waiting channel shows how many releases wait", () => {
+  const line = summarise({
+    repo: "o/r",
+    errors: [],
+    channels: [
+      {
+        channel: "main",
+        branch: "main",
+        planned: [],
+        created: [],
+        pending: 2,
+        note: "the channel waits",
+      },
+    ],
+  });
+  assert.match(line ?? "", /\+2 pending/);
 });

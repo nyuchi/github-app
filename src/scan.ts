@@ -41,6 +41,7 @@ const HISTORY_NODES = `
   pageInfo { hasNextPage endCursor }
   nodes {
     oid
+    committedDate
     associatedPullRequests(first: 5) { nodes { number merged baseRefName } }
   }`;
 
@@ -119,6 +120,7 @@ const MAX_TAG_PAGES = 51;
 
 interface HistoryNode {
   oid: string;
+  committedDate?: string;
   associatedPullRequests?: {
     nodes: { number: number; merged: boolean; baseRefName?: string }[];
   };
@@ -344,12 +346,18 @@ export interface LedgerEntry {
   prerelease: boolean;
   latest: boolean;
   pr: number | null;
-  /** Failed repair attempts so far. */
+  /** Runs where repair was stuck (a proof failed, a permanent error). */
   attempts?: number;
+  /** Runs where GitHub could not answer (rate limit, 5xx, network). */
+  transient?: number;
+  /** When the entry was written (ms since epoch). */
+  at?: number;
 }
 
-/** Repair attempts per ledger entry before it is dropped and reported. */
+/** Stuck runs per ledger entry before it is dropped and reported. */
 const MAX_REPAIR_ATTEMPTS = 10;
+/** Runs GitHub could not answer before an entry is dropped (about a month). */
+const MAX_TRANSIENT_RUNS = 30;
 
 /**
  * The repository's record of tags THIS APP is writing or wrote without a
@@ -619,6 +627,7 @@ async function scanChannel(
         history.commits,
         prless,
         3_600_000,
+        node.target?.history?.nodes?.[0]?.committedDate,
       ));
     if (recent) {
       entry.note =
@@ -716,6 +725,7 @@ async function scanChannel(
         tag: t.tag,
         object,
         commit: t.commit,
+        at: Date.now(),
         prerelease: t.prerelease,
         latest: t.latest,
         pr: t.pr,
@@ -813,6 +823,7 @@ export async function arrivedRecently(
   history: Commit[],
   subjects: Commit[],
   ms: number,
+  headCommittedAt?: string,
 ): Promise<boolean> {
   let body: unknown;
   try {
@@ -828,7 +839,15 @@ export async function arrivedRecently(
   // The record must already show the branch's current head as its newest
   // event; otherwise it lags behind the push and cannot place anything.
   const newest = body[0] as { after?: unknown } | undefined;
-  if (!newest || newest.after !== history[0]?.oid) return true;
+  if (!newest || newest.after !== history[0]?.oid) {
+    // The record does not show the head arriving. Right after a push that
+    // is lag, and the channel waits. But a head committed more than two
+    // days ago did not arrive in the last hour by any merge GitHub is still
+    // indexing, and the record may simply not reach back that far (an
+    // import, a template): then waiting would never end.
+    const t = headCommittedAt ? Date.parse(headCommittedAt) : NaN;
+    return !(Number.isFinite(t) && Date.now() - t > 48 * 3_600_000);
+  }
   let seenOld = false;
   const now = Date.now();
   const befores: string[] = [];
@@ -1031,50 +1050,58 @@ export async function createTagRef(
 }
 
 /**
- * Does `tag` have a release, drafts included? GET /releases/tags/{tag}
- * answers for published releases (and pre-releases); drafts are only in the
- * list, which is read up to 10 pages. "unknown" when the list is longer and
- * the draft check could not finish.
+ * Draft releases, read once per repair pass: drafts are not answered by
+ * GET /releases/tags/{tag}. The list is newest first, and a draft for one of
+ * our tags cannot be older than the tag, so the read stops at the first
+ * release created more than a day before the oldest pending entry. null when
+ * that point was not reached within 10 pages.
  */
-async function hasRelease(
+async function draftTags(
   env: Env,
   token: string,
   owner: string,
   name: string,
-  tag: string,
-): Promise<boolean | "unknown"> {
-  try {
-    await gh(
-      env,
-      token,
-      `/repos/${owner}/${name}/releases/tags/${encodeURIComponent(tag)}`,
-    );
-    return true;
-  } catch (e) {
-    if (!(e instanceof AppError) || e.status !== 404) throw e;
-  }
+  since: number,
+): Promise<Set<string> | null> {
+  const drafts = new Set<string>();
   let url: string | null = `/repos/${owner}/${name}/releases?per_page=100`;
   for (let i = 0; url && i < 10; i++) {
     const res: GhResponse = await gh(env, token, url);
     if (!Array.isArray(res.body))
       throw new AppError("releases could not be read", 502);
-    if (res.body.some((r) => (r as { tag_name?: unknown }).tag_name === tag))
-      return true;
+    for (const r of res.body as {
+      tag_name?: unknown;
+      draft?: unknown;
+      created_at?: unknown;
+    }[]) {
+      if (r.draft === true && typeof r.tag_name === "string")
+        drafts.add(r.tag_name);
+      const at =
+        typeof r.created_at === "string" ? Date.parse(r.created_at) : NaN;
+      if (Number.isFinite(at) && at < since - 86_400_000) return drafts;
+    }
     const m = /<([^>]+)>;\s*rel="next"/.exec(res.headers.get("link") || "");
     url = m ? m[1] : null;
   }
-  return url ? "unknown" : false;
+  return url ? null : drafts;
 }
+
+type Outcome = { outcome: "done" | "stuck" | "transient"; why: string };
 
 /**
  * Give each ledger entry (a tag this app wrote whose release is missing) its
  * release, when every proof still holds:
- * - the live tag of that name points at the very tag object recorded, and
- *   peels to the recorded commit (otherwise it is not ours: drop it);
+ * - the live tag of that name points at the very tag object recorded (a tag
+ *   object's sha hashes its content, so it still names the recorded commit);
  * - the commit is still on one of the protected release branches;
  * - no release exists for it yet, drafts included (if one does, drop it);
  * - the commit's workflows would not start on a release.
- * Channel and "latest" come from the tag, never from the branch walked.
+ * Channel, "latest" and the PR come from the ledger entry, recorded when the
+ * tag was planned.
+ *
+ * Failures are sorted: "transient" (rate limit, 5xx, the network) and
+ * "stuck" (anything else). Both are bounded, transient far more loosely, so
+ * nothing retries forever; every give-up is reported.
  */
 export async function repairReleases(
   env: Env,
@@ -1108,47 +1135,41 @@ export async function repairReleases(
   for (const t of tags)
     if (!fresh.some((x) => x.name === t.name)) fresh.push(t);
   const live = versionTags(fresh, prefix);
+  const oldest = Math.min(...pending.map((e) => e.at ?? 0));
+  let drafts: Set<string> | null | undefined; // read lazily, once
+
   const repaired: string[] = [];
-  let reason = "";
   for (const e of pending) {
-    let outcome: "done" | "stuck" | "transient";
-    let why = "";
-    reason = "";
+    let r: Outcome;
     try {
-      outcome = await repairOne(e);
-      why = reason;
+      r = await repairOne(e);
     } catch (err) {
-      why = msg(err);
-      // Rate limits, 5xx and network trouble are not the entry's fault and
-      // never count towards giving up. Anything else (a validation error)
-      // does.
-      // Only a rate limit (429, or a 403 that says so), a 5xx or a network
-      // failure is transient. Any other 403 (no permission) or 4xx, and any
-      // unexpected error, is stuck: bounded, and reported.
+      const why = msg(err);
       const st = err instanceof AppError ? err.status : -1;
-      const rateLimited = st === 429 || (st === 403 && /rate limit/i.test(why));
-      const network =
-        !(err instanceof AppError) &&
-        err instanceof TypeError &&
-        /fetch/i.test(why);
-      outcome = rateLimited || st >= 500 || network ? "transient" : "stuck";
+      const transient =
+        st === 429 ||
+        (st === 403 && /rate limit/i.test(why)) ||
+        st >= 500 ||
+        !(err instanceof AppError);
+      r = { outcome: transient ? "transient" : "stuck", why };
     }
-    if (outcome === "done") continue;
-    if (outcome === "transient") {
-      if (why) errors.push(`release for ${e.tag} (will retry): ${why}`);
-      continue;
-    }
-    // Stuck (a permanent error, or a proof that keeps failing): bounded.
+    if (r.outcome === "done") continue;
     try {
-      const attempts = (e.attempts ?? 0) + 1;
-      if (attempts >= MAX_REPAIR_ATTEMPTS) {
+      const transient = r.outcome === "transient";
+      const count = transient ? (e.transient ?? 0) + 1 : (e.attempts ?? 0) + 1;
+      const limit = transient ? MAX_TRANSIENT_RUNS : MAX_REPAIR_ATTEMPTS;
+      if (count >= limit) {
         await ledger.remove(e.tag);
         errors.push(
-          `release for ${e.tag}: giving up after ${attempts} runs${why ? `: ${why}` : ""}`,
+          `release for ${e.tag}: giving up after ${count} ${transient ? "failed" : "stuck"} runs: ${r.why}`,
         );
       } else {
-        await ledger.add({ ...e, attempts });
-        if (why) errors.push(`release for ${e.tag} (run ${attempts}): ${why}`);
+        await ledger.add(
+          transient ? { ...e, transient: count } : { ...e, attempts: count },
+        );
+        errors.push(
+          `release for ${e.tag} (${transient ? "will retry" : `stuck, run ${count}`}): ${r.why}`,
+        );
       }
     } catch (le) {
       errors.push(
@@ -1158,37 +1179,45 @@ export async function repairReleases(
   }
   return repaired;
 
-  // done: released, or nothing left to do; stuck: a proof failed (try again
-  // later, but not forever); transient: GitHub could not answer.
-  async function repairOne(
-    e: LedgerEntry,
-  ): Promise<"done" | "stuck" | "transient"> {
+  async function repairOne(e: LedgerEntry): Promise<Outcome> {
     // The ref through REST, which is consistent with this app's own REST
     // writes (a GraphQL read may lag behind them).
     const ref = await tagRef(env, token, owner, name, e.tag);
-    if (ref === "absent") {
-      await ledger.remove(e.tag); // never created, or deleted: nothing to do
-      return "done";
-    }
-    if (ref === null) {
-      reason = "the tag ref answered in an unexpected shape";
-      return "stuck";
-    }
-    if (ref.type !== "tag" || ref.sha !== e.object) {
-      // Re-made by someone else (a different object), even under our name.
+    if (
+      ref === "absent" ||
+      (ref && (ref.type !== "tag" || ref.sha !== e.object))
+    ) {
+      // Never created, deleted, or re-made by someone else: not ours.
       await ledger.remove(e.tag);
-      return "done";
+      return { outcome: "done", why: "" };
     }
-    // A tag object's sha is the hash of its content, so the recorded object
-    // still names the recorded commit.
-    const has = await hasRelease(env, token, owner, name, e.tag);
-    if (has === true) {
+    if (ref === null)
+      return {
+        outcome: "stuck",
+        why: "the tag ref answered in an unexpected shape",
+      };
+    try {
+      await gh(
+        env,
+        token,
+        `/repos/${owner}/${name}/releases/tags/${encodeURIComponent(e.tag)}`,
+      );
+      await ledger.remove(e.tag); // it has a release
+      return { outcome: "done", why: "" };
+    } catch (err) {
+      if (!(err instanceof AppError) || err.status !== 404) throw err;
+    }
+    if (drafts === undefined)
+      drafts = await draftTags(env, token, owner, name, oldest);
+    if (drafts === null) {
+      return {
+        outcome: "stuck",
+        why: "the release list is too long to rule out a draft",
+      };
+    }
+    if (drafts.has(e.tag)) {
       await ledger.remove(e.tag);
-      return "done";
-    }
-    if (has === "unknown") {
-      reason = "more than 1,000 releases; cannot rule out a draft";
-      return "stuck";
+      return { outcome: "done", why: "" };
     }
     let reachable = false;
     for (const b of protectedBranches) {
@@ -1197,13 +1226,16 @@ export async function repairReleases(
         break;
       }
     }
-    if (!reachable) {
-      reason = "the commit is not on a protected release branch";
-      return "stuck";
-    }
+    if (!reachable)
+      return {
+        outcome: "stuck",
+        why: "the commit is not on a protected release branch",
+      };
     if (facts.get(e.commit)?.publishesOnTag !== false) {
-      reason = "a workflow at the commit would start on the release";
-      return "stuck";
+      return {
+        outcome: "stuck",
+        why: "a workflow at the commit would start on the release",
+      };
     }
     // Latest only if, as recorded, it was the newest default-branch release
     // AND no higher non-beta version tag has appeared since.
@@ -1220,7 +1252,7 @@ export async function repairReleases(
     });
     await ledger.remove(e.tag);
     repaired.push(e.tag);
-    return "done";
+    return { outcome: "done", why: "" };
   }
 }
 
@@ -1427,7 +1459,9 @@ export function summarise(r: RepoReport): string | null {
     parts.push(`releases repaired: ${r.repaired.join(" ")}`);
   for (const c of r.channels) {
     if (c.note && !c.planned.length) {
-      parts.push(`${c.branch}: not tagged (${c.note})`);
+      parts.push(
+        `${c.branch}: not tagged (${c.note})${c.pending ? ` (+${c.pending} pending)` : ""}`,
+      );
       continue;
     }
     if (!c.planned.length) continue;

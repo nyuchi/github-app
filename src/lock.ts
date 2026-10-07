@@ -114,7 +114,12 @@ export function storageLedger(storage: KV): ReleaseLedger {
         typeof (e as LedgerEntry).prerelease === "boolean" &&
         typeof (e as LedgerEntry).latest === "boolean" &&
         ((e as LedgerEntry).pr === null ||
-          Number.isSafeInteger((e as LedgerEntry).pr)),
+          Number.isSafeInteger((e as LedgerEntry).pr)) &&
+        (["attempts", "transient", "at"] as const).every(
+          (k) =>
+            (e as LedgerEntry)[k] === undefined ||
+            Number.isSafeInteger((e as LedgerEntry)[k]),
+        ),
     );
   };
   return {
