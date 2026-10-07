@@ -33,6 +33,7 @@ GITHUB_API = "https://api.github.com"
 # The Nyuchi App (slug `nyuchi`), moving to the bundu-labs enterprise. An id
 # is not a credential: it grants nothing without the private key.
 GITHUB_APP_ID = "4980118"
+APP_SLUG = "nyuchi"
 
 # OUTER BOUND. The bundu-labs enterprise orgs. nyuchiGOV is outside the
 # enterprise and is never listed. Empty denies everything.

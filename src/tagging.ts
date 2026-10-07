@@ -31,6 +31,10 @@ export interface TagRef {
   commit: string;
   /** An annotated tag's message (absent for lightweight tags). */
   message?: string;
+  /** The annotated tag object's id (absent for lightweight tags). */
+  object?: string;
+  /** True when the tag does not peel to a commit (fail closed upstream). */
+  unresolved?: boolean;
 }
 
 export interface PlannedTag {
@@ -206,7 +210,12 @@ export function startsOnTagOrRelease(on: unknown): boolean {
       if (!p || typeof p !== "object") return true; // bare `push:`
       const f = p as Record<string, unknown>;
       if ("tags" in f || "tags-ignore" in f) return true;
-      if (!("branches" in f) && !("branches-ignore" in f)) return true;
+      // Only a real filter (a non-empty string or list) limits a push to
+      // branches; `branches:` with no value is as good as absent.
+      const real = (v: unknown) =>
+        (typeof v === "string" && v.length > 0) ||
+        (Array.isArray(v) && v.length > 0);
+      if (!real(f.branches) && !real(f["branches-ignore"])) return true;
     }
     return false;
   }

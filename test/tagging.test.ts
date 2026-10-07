@@ -267,3 +267,13 @@ test("fail closed: a workflow that is not a mapping with on: is unreadable, so p
     assert.deepEqual(f.unreadable, ["x.yml"]);
   }
 });
+
+test("review: `branches:` with no value is no filter, so the push runs for tags", () => {
+  assert.equal(
+    startsOnTagOrRelease({ push: { branches: null, paths: ["x"] } }),
+    true,
+  );
+  assert.equal(startsOnTagOrRelease({ push: { branches: [] } }), true);
+  assert.equal(startsOnTagOrRelease({ push: { branches: "" } }), true);
+  assert.equal(startsOnTagOrRelease({ push: { branches: "main" } }), false);
+});
