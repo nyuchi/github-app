@@ -1,8 +1,10 @@
 // Types for the vendored org versioning policy (next-version.mjs), a
 // byte-for-byte copy of nyuchi/.github at the commit in POLICY_SOURCE.
-// test/policy-types.test.ts checks these names against the module itself.
+// test/policy-types.test.ts checks these names against the module both ways.
 export declare const CEILING: number;
+export declare const DEFAULT_PREFIX: string;
 export declare class PolicyError extends Error {}
+export declare class UsageError extends Error {}
 /** THE version parser: MAJOR.MINOR.PATCH, each 0..999, nothing else. */
 export declare function isStrictVersion(v: unknown): boolean;
 export declare function parseStrict(v: string): {
@@ -24,18 +26,27 @@ export declare function nextVersion(
 export declare function check(
   current: string,
   proposed: string,
-  opts: {
-    channel: "staging" | "main";
-    allowMajor?: boolean;
-    bump?: string;
-    hasTags?: boolean;
-  },
+  opts: { channel: "staging" | "main"; allowMajor?: boolean; bump?: string },
 ): string;
 export declare function highest(
   refs: Iterable<string>,
   prefix?: string,
 ): string;
-export declare function countTags(
-  refs: Iterable<string>,
-  prefix?: string,
-): number;
+export declare function currentVersion(
+  refs: string[],
+  opts?: { prefix?: string; fromFiles?: string },
+): { kind: string; version?: string; tagged?: string; written?: string };
+export declare function decide(
+  refs: string[],
+  opts: {
+    mode: "check" | "compute";
+    channel: "staging" | "main";
+    bump?: string;
+    manual?: boolean;
+    proposed?: string;
+    fromFiles?: string;
+    allowMajor?: boolean;
+    prefix?: string;
+  },
+): unknown;
+export declare function isMain(metaUrl: string, argv1?: string): boolean;
