@@ -519,7 +519,9 @@ async function scanInner(
     }
   }
 
-  if (opts.live && opts.ledger) {
+  // Repair needs every release branch to prove reachability, so it runs
+  // only on full scans (the nightly pass), never on a one-channel push.
+  if (opts.live && opts.ledger && !opts.only) {
     try {
       const protectedBranches = branches
         .map((b) => b.node?.name)
@@ -621,7 +623,13 @@ async function scanChannel(
     if (recent) {
       entry.note =
         "a commit's pull request is not indexed yet, or it just arrived; the channel waits for a later run";
-      entry.pending = history.untagged.length;
+      entry.pending = planBranch({
+        channel,
+        history: history.commits,
+        tags,
+        prefix,
+        max: 0,
+      }).pending;
       return;
     }
   }
@@ -817,16 +825,27 @@ export async function arrivedRecently(
     return true;
   }
   if (!Array.isArray(body)) return true;
+  // The record must already show the branch's current head as its newest
+  // event; otherwise it lags behind the push and cannot place anything.
+  const newest = body[0] as { after?: unknown } | undefined;
+  if (!newest || newest.after !== history[0]?.oid) return true;
+  let seenOld = false;
   const now = Date.now();
   const befores: string[] = [];
   for (const ev of body as { timestamp?: unknown; before?: unknown }[]) {
     const t =
       typeof ev?.timestamp === "string" ? Date.parse(ev.timestamp) : NaN;
     if (!Number.isFinite(t)) return true;
-    if (now - t >= ms) break; // newest first: the rest are older
+    if (now - t >= ms) {
+      seenOld = true;
+      break; // newest first: the rest are older
+    }
     if (typeof ev.before !== "string") return true;
     befores.push(ev.before);
   }
+  // A page entirely inside the window: older recent events may be on the
+  // next page, so the cut is unknown.
+  if (!seenOld && body.length >= 100) return true;
   if (!befores.length) return false;
   // Commits above the oldest recent "before" in the linear history arrived
   // within the window. A "before" outside the history read: assume recent.
@@ -1011,28 +1030,40 @@ export async function createTagRef(
   });
 }
 
-/** Every release's tag name, drafts included; null if not read in full. */
-async function releaseTags(
+/**
+ * Does `tag` have a release, drafts included? GET /releases/tags/{tag}
+ * answers for published releases (and pre-releases); drafts are only in the
+ * list, which is read up to 10 pages. "unknown" when the list is longer and
+ * the draft check could not finish.
+ */
+async function hasRelease(
   env: Env,
   token: string,
   owner: string,
   name: string,
-): Promise<Set<string> | null> {
-  // GET /releases/tags/{tag} hides drafts, so the list is read instead.
-  const seen = new Set<string>();
+  tag: string,
+): Promise<boolean | "unknown"> {
+  try {
+    await gh(
+      env,
+      token,
+      `/repos/${owner}/${name}/releases/tags/${encodeURIComponent(tag)}`,
+    );
+    return true;
+  } catch (e) {
+    if (!(e instanceof AppError) || e.status !== 404) throw e;
+  }
   let url: string | null = `/repos/${owner}/${name}/releases?per_page=100`;
   for (let i = 0; url && i < 10; i++) {
     const res: GhResponse = await gh(env, token, url);
     if (!Array.isArray(res.body))
       throw new AppError("releases could not be read", 502);
-    for (const r of res.body) {
-      const t = (r as { tag_name?: unknown }).tag_name;
-      if (typeof t === "string") seen.add(t);
-    }
+    if (res.body.some((r) => (r as { tag_name?: unknown }).tag_name === tag))
+      return true;
     const m = /<([^>]+)>;\s*rel="next"/.exec(res.headers.get("link") || "");
     url = m ? m[1] : null;
   }
-  return url ? null : seen;
+  return url ? "unknown" : false;
 }
 
 /**
@@ -1059,7 +1090,6 @@ export async function repairReleases(
   const pending = await ledger.list();
   if (!pending.length) return [];
   // Per-repository reads, once.
-  const releases = await releaseTags(env, token, owner, name);
   const protectedBranches: string[] = [];
   for (const b of branches) {
     if (await branchIsProtected(env, token, owner, name, b))
@@ -1079,21 +1109,29 @@ export async function repairReleases(
     if (!fresh.some((x) => x.name === t.name)) fresh.push(t);
   const live = versionTags(fresh, prefix);
   const repaired: string[] = [];
+  let reason = "";
   for (const e of pending) {
     let outcome: "done" | "stuck" | "transient";
     let why = "";
+    reason = "";
     try {
       outcome = await repairOne(e);
+      why = reason;
     } catch (err) {
       why = msg(err);
       // Rate limits, 5xx and network trouble are not the entry's fault and
       // never count towards giving up. Anything else (a validation error)
       // does.
-      const st = err instanceof AppError ? err.status : 0;
-      outcome =
-        st === 0 || st === 403 || st === 429 || st >= 500
-          ? "transient"
-          : "stuck";
+      // Only a rate limit (429, or a 403 that says so), a 5xx or a network
+      // failure is transient. Any other 403 (no permission) or 4xx, and any
+      // unexpected error, is stuck: bounded, and reported.
+      const st = err instanceof AppError ? err.status : -1;
+      const rateLimited = st === 429 || (st === 403 && /rate limit/i.test(why));
+      const network =
+        !(err instanceof AppError) &&
+        err instanceof TypeError &&
+        /fetch/i.test(why);
+      outcome = rateLimited || st >= 500 || network ? "transient" : "stuck";
     }
     if (outcome === "done") continue;
     if (outcome === "transient") {
@@ -1132,7 +1170,10 @@ export async function repairReleases(
       await ledger.remove(e.tag); // never created, or deleted: nothing to do
       return "done";
     }
-    if (ref === null) return "transient";
+    if (ref === null) {
+      reason = "the tag ref answered in an unexpected shape";
+      return "stuck";
+    }
     if (ref.type !== "tag" || ref.sha !== e.object) {
       // Re-made by someone else (a different object), even under our name.
       await ledger.remove(e.tag);
@@ -1140,10 +1181,14 @@ export async function repairReleases(
     }
     // A tag object's sha is the hash of its content, so the recorded object
     // still names the recorded commit.
-    if (releases === null) return "transient";
-    if (releases.has(e.tag)) {
+    const has = await hasRelease(env, token, owner, name, e.tag);
+    if (has === true) {
       await ledger.remove(e.tag);
       return "done";
+    }
+    if (has === "unknown") {
+      reason = "more than 1,000 releases; cannot rule out a draft";
+      return "stuck";
     }
     let reachable = false;
     for (const b of protectedBranches) {
@@ -1152,8 +1197,14 @@ export async function repairReleases(
         break;
       }
     }
-    if (!reachable) return "stuck";
-    if (facts.get(e.commit)?.publishesOnTag !== false) return "stuck";
+    if (!reachable) {
+      reason = "the commit is not on a protected release branch";
+      return "stuck";
+    }
+    if (facts.get(e.commit)?.publishesOnTag !== false) {
+      reason = "a workflow at the commit would start on the release";
+      return "stuck";
+    }
     // Latest only if, as recorded, it was the newest default-branch release
     // AND no higher non-beta version tag has appeared since.
     const version = e.tag.slice(prefix.length);

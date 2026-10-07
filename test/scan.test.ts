@@ -70,7 +70,7 @@ interface FakeOpts {
   /** Override the tag object a REST ref read reports, per tag name. */
   refObject?: Record<string, string>;
   /** GitHub's activity record for the ref, newest first. */
-  activity?: { timestamp: string; before: string }[];
+  activity?: { timestamp: string; before: string; after?: string }[];
 }
 
 /**
@@ -79,6 +79,7 @@ interface FakeOpts {
  */
 function fakeGitHub(opts: FakeOpts) {
   const tags: FakeTag[] = [...(opts.tags ?? [])];
+  const released = new Set<string>();
   const tagObjects = new Map<string, { commit: string; message: string }>();
   const byHash = new Map<string, string>();
   for (const n of Object.keys(opts.workflowsAt ?? {})) byHash.set(H(n), n);
@@ -172,9 +173,26 @@ function fakeGitHub(opts: FakeOpts) {
           : { status: 404, body: { message: "Not Found" } };
       }
       if (method === "GET" && url.includes("/activity?")) {
+        // By default the record is up to date: its newest event moved the
+        // branch to its current head, long ago.
+        const branch = decodeURIComponent(
+          url.split("ref=")[1].split("&")[0],
+        ).replace("refs/heads/", "");
+        const repo = (opts.repo ?? {}) as Record<
+          string,
+          { target?: { history?: { nodes?: { oid: string }[] } } } | null
+        >;
+        const fallback = branch === "staging" ? H("s5") : H("m3");
+        const node =
+          branch === "staging" ? repo.staging : repo.defaultBranchRef;
+        const head = node?.target?.history?.nodes?.[0]?.oid ?? fallback;
         return {
           body: opts.activity ?? [
-            { timestamp: "2026-09-15T00:00:00Z", before: "0".repeat(40) },
+            {
+              timestamp: "2026-09-15T00:00:00Z",
+              before: "0".repeat(40),
+              after: head,
+            },
           ],
         };
       }
@@ -202,9 +220,17 @@ function fakeGitHub(opts: FakeOpts) {
         };
       }
       if (method === "GET" && url.includes("/releases/tags/")) {
-        return opts.releaseExists === false
-          ? { status: 404, body: { message: "Not Found" } }
-          : { body: {} };
+        const t = decodeURIComponent(url.split("/releases/tags/")[1]);
+        return opts.releaseExists === true || released.has(t)
+          ? { body: { tag_name: t } }
+          : { status: 404, body: { message: "Not Found" } };
+      }
+      if (method === "GET" && url.includes("/releases?")) {
+        return { body: [...released].map((tag_name) => ({ tag_name })) };
+      }
+      if (method === "POST" && url.endsWith("/releases")) {
+        released.add((body as { tag_name: string }).tag_name);
+        return { status: 201, body: {} };
       }
       if (method === "POST" && url.endsWith("/git/tags")) {
         const b = body as { tag: string; object: string; message: string };
@@ -1031,12 +1057,7 @@ test("release repair: channel comes from the tag; staging betas do not take 'lat
       : fake.route(method, url, body),
   );
   try {
-    await scanRepo(testEnv(), "tok", "nyuchi", "x", {
-      trigger: "push",
-      only: "main",
-      live: true,
-      ledger,
-    });
+    await scanRepo(testEnv(), "tok", "nyuchi", "x", live({ ledger }));
     const rel = m.calls.find(
       (c) => c.method === "POST" && c.url.endsWith("/releases"),
     )!;
@@ -1089,7 +1110,7 @@ test("release repair: a release list that cannot be read in full leaves the ledg
     repo: { staging: null, workflows: tree() },
   });
   const m = mockFetch((method, url, body) => {
-    if (method === "GET" && url.includes("/releases")) {
+    if (method === "GET" && url.includes("/releases?")) {
       return {
         body: [{ tag_name: "other" }],
         headers: { link: '<https://api.github.test/next>; rel="next"' },
@@ -1560,7 +1581,9 @@ test("with the budget spent, a channel is not even read", async () => {
 
 test("night: a PR-less commit that arrived within the hour holds the channel; an older one does not", async () => {
   const history = [node("m3", 30), node("direct", null), node("m1", 10)];
-  const mk = (activity: { timestamp: string; before: string }[]) =>
+  const mk = (
+    activity: { timestamp: string; before: string; after?: string }[],
+  ) =>
     withFake({
       tags: [{ name: "v0.0.9", commit: H("s4") }],
       activity,
@@ -1578,8 +1601,8 @@ test("night: a PR-less commit that arrived within the hour holds the channel; an
     new Date(Date.now() - n * 60_000).toISOString();
   // "direct" arrived 5 minutes ago (the branch moved from m1 to it).
   const a = mk([
-    { timestamp: minutesAgo(2), before: H("direct") },
-    { timestamp: minutesAgo(5), before: H("m1") },
+    { timestamp: minutesAgo(2), before: H("direct"), after: H("m3") },
+    { timestamp: minutesAgo(5), before: H("m1"), after: H("direct") },
   ]);
   try {
     const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", live());
@@ -1590,8 +1613,8 @@ test("night: a PR-less commit that arrived within the hour holds the channel; an
   }
   // Only m3 arrived recently; "direct" is older: tag everything.
   const b = mk([
-    { timestamp: minutesAgo(2), before: H("direct") },
-    { timestamp: minutesAgo(600), before: H("m1") },
+    { timestamp: minutesAgo(2), before: H("direct"), after: H("m3") },
+    { timestamp: minutesAgo(600), before: H("m1"), after: H("direct") },
   ]);
   try {
     const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", live());
@@ -1600,7 +1623,10 @@ test("night: a PR-less commit that arrived within the hour holds the channel; an
     b.m.restore();
   }
   // A "before" outside the history read: cannot place it, so it waits.
-  const c = mk([{ timestamp: minutesAgo(2), before: H("elsewhere") }]);
+  const c = mk([
+    { timestamp: minutesAgo(2), before: H("elsewhere"), after: H("m3") },
+  ]);
+  // (and see below: a record that lags behind the head also waits)
   try {
     await scanRepo(testEnv(), "tok", "nyuchi", "x", live());
     assert.equal(writes(c.m.calls).length, 0);
@@ -1619,7 +1645,10 @@ test("repair: transient failures never count; a permanent one is dropped after b
     const m = mockFetch((method, url, body) => {
       if (method === "GET" && url.includes("/releases?")) return { body: [] };
       if (method === "POST" && url.endsWith("/releases"))
-        return { status, body: { message: "x" } };
+        return {
+          status,
+          body: { message: status === 403 ? "API rate limit exceeded" : "x" },
+        };
       return fake.route(method, url, body);
     });
     try {
@@ -1693,6 +1722,94 @@ test("on push, the pushed head's own tagger is seen even beyond the plan's cap",
       live({ trigger: "push", only: "staging" }),
     );
     assert.match(r.channels[0].note ?? "", /tags this channel itself/);
+  } finally {
+    m.restore();
+  }
+});
+
+test("repair runs only on full (nightly) scans, never on a one-channel push", async () => {
+  const ledger = memLedger([
+    entry("v0.0.9", H("s4"), { prerelease: true, latest: false }),
+  ]);
+  const { m } = withFake({
+    tags: [{ name: "v0.0.9", commit: H("s4") }],
+    repo: { workflows: tree() },
+  });
+  try {
+    await scanRepo(
+      testEnv(),
+      "tok",
+      "nyuchi",
+      "x",
+      live({ trigger: "push", only: "main", ledger }),
+    );
+    assert.equal(
+      m.calls.filter((c) => c.url.includes("/git/ref/tags/")).length,
+      0,
+    );
+    assert.equal(
+      (await ledger.list())[0]?.attempts,
+      undefined,
+      "no attempt spent",
+    );
+  } finally {
+    m.restore();
+  }
+});
+
+test("night: an activity record that lags behind the head, or a full page in the window, waits", async () => {
+  const minutesAgo = (n: number) =>
+    new Date(Date.now() - n * 60_000).toISOString();
+  const history = [node("m3", 30), node("direct", null), node("m1", 10)];
+  const repo = {
+    staging: null,
+    defaultBranchRef: {
+      name: "main",
+      target: { history: { pageInfo: { hasNextPage: false }, nodes: history } },
+    },
+  };
+  for (const activity of [
+    // newest event is not the current head: the record lags
+    [{ timestamp: minutesAgo(600), before: H("m1"), after: H("direct") }],
+    // 100 events, all inside the window: the cut may be on the next page
+    Array.from({ length: 100 }, () => ({
+      timestamp: minutesAgo(1),
+      before: H("m3"),
+      after: H("m3"),
+    })),
+  ]) {
+    const { m } = withFake({
+      tags: [{ name: "v0.0.9", commit: H("s4") }],
+      repo,
+      activity,
+    });
+    try {
+      const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", live());
+      assert.equal(writes(m.calls).length, 0);
+      assert.match(r.channels[0].note ?? "", /channel waits/);
+    } finally {
+      m.restore();
+    }
+  }
+});
+
+test("repair: a 403 that is not a rate limit (no permission) counts as stuck", async () => {
+  const ledger = memLedger([entry("v0.3.0", H("m3"))]);
+  const fake = fakeGitHub({
+    tags: [{ name: "v0.3.0", commit: H("m3") }],
+    repo: { staging: null, workflows: tree() },
+  });
+  const m = mockFetch((method, url, body) =>
+    method === "POST" && url.endsWith("/releases")
+      ? {
+          status: 403,
+          body: { message: "Resource not accessible by integration" },
+        }
+      : fake.route(method, url, body),
+  );
+  try {
+    await scanRepo(testEnv(), "tok", "nyuchi", "x", live({ ledger }));
+    assert.equal((await ledger.list())[0]?.attempts, 1);
   } finally {
     m.restore();
   }
