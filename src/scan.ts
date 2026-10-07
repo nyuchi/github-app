@@ -356,7 +356,7 @@ export interface LedgerEntry {
 const MAX_REPAIR_ATTEMPTS = 10;
 /** Runs GitHub could not answer before an entry is dropped (about a month). */
 const MAX_TRANSIENT_RUNS = 30;
-/** Commits per workflow-facts query in repair (the scan path is capped too). */
+/** Commits per workflow-facts query (commitFacts batches every caller). */
 const FACTS_BATCH = 10;
 
 /**
@@ -1107,19 +1107,13 @@ export async function repairReleases(
         if (await branchIsProtected(env, token, owner, name, b))
           protectedBranches.push(b);
       }
-      // Batched like the scan path, so a long ledger is never one huge query.
-      const facts = new Map<string, WorkflowFacts>();
-      const commits = [...new Set(pending.map((e) => e.commit))];
-      for (let i = 0; i < commits.length; i += FACTS_BATCH) {
-        const part = await commitFacts(
-          env,
-          token,
-          owner,
-          name,
-          commits.slice(i, i + FACTS_BATCH),
-        );
-        for (const [k, v] of part) facts.set(k, v);
-      }
+      const facts = await commitFacts(
+        env,
+        token,
+        owner,
+        name,
+        pending.map((e) => e.commit),
+      );
       // Fresh, joined with this run's own writes: "newer" must see tags made
       // by anyone during the run, and our own even if the index lags.
       const fresh = await allTags(env, token, owner, name);
@@ -1335,6 +1329,29 @@ export async function allTags(
  * an unreadable file all give facts that count as publishing.
  */
 export async function commitFacts(
+  env: Env,
+  token: string,
+  owner: string,
+  name: string,
+  oids: string[],
+): Promise<Map<string, WorkflowFacts>> {
+  // In batches, so a long list is never one huge query.
+  const out = new Map<string, WorkflowFacts>();
+  const unique = [...new Set(oids)];
+  for (let i = 0; i < unique.length; i += FACTS_BATCH) {
+    const part = await commitFactsOnce(
+      env,
+      token,
+      owner,
+      name,
+      unique.slice(i, i + FACTS_BATCH),
+    );
+    for (const [k, v] of part) out.set(k, v);
+  }
+  return out;
+}
+
+async function commitFactsOnce(
   env: Env,
   token: string,
   owner: string,
