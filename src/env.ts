@@ -24,8 +24,6 @@ export interface Env {
 
   // ---- Identity -------------------------------------------------------------
   GITHUB_APP_ID?: string;
-  /** The App's slug; its bot signs tags as <id>+<slug>[bot]@users.noreply.github.com. */
-  APP_SLUG?: string;
   GITHUB_API?: string;
 
   // ---- Scope ----------------------------------------------------------------

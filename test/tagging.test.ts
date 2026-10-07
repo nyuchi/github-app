@@ -277,3 +277,21 @@ test("review: `branches:` with no value is no filter, so the push runs for tags"
   assert.equal(startsOnTagOrRelease({ push: { branches: "" } }), true);
   assert.equal(startsOnTagOrRelease({ push: { branches: "main" } }), false);
 });
+
+test("review: on: is an allowlist; an unknown or misspelt event counts as publishing", () => {
+  assert.equal(
+    startsOnTagOrRelease({
+      pull_request: null,
+      schedule: [{ cron: "0 0 * * *" }],
+    }),
+    false,
+  );
+  assert.equal(startsOnTagOrRelease({ deployment: null }), true);
+  assert.equal(startsOnTagOrRelease({ registry_package: null }), true);
+  assert.equal(startsOnTagOrRelease({ Release: null }), true);
+  assert.equal(
+    startsOnTagOrRelease(["pull_request", "some_future_event"]),
+    true,
+  );
+  assert.equal(startsOnTagOrRelease("workflow_dispatch"), false);
+});

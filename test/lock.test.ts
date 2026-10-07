@@ -79,3 +79,21 @@ test("runs for one repository share one lock instance; names are case-insensitiv
   });
   assert.deepEqual(seen, ["nyuchi/api", "nyuchi/api"]);
 });
+
+import { storageLedger } from "../src/lock";
+
+test("the release ledger persists in the lock's storage, without duplicates", async () => {
+  const mem = new Map<string, unknown>();
+  const storage = {
+    get: async <T>(k: string) => mem.get(k) as T | undefined,
+    put: async <T>(k: string, v: T) => void mem.set(k, v),
+  };
+  const l = storageLedger(storage);
+  assert.deepEqual(await l.list(), []);
+  await l.add("v0.1.0");
+  await l.add("v0.1.0");
+  await l.add("v0.2.0");
+  assert.deepEqual(await storageLedger(storage).list(), ["v0.1.0", "v0.2.0"]);
+  await l.remove("v0.1.0");
+  assert.deepEqual(await l.list(), ["v0.2.0"]);
+});

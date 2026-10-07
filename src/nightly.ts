@@ -46,6 +46,13 @@ export async function nightly(
   const result: NightlyResult = { orgs: [], repos: 0, reports: [], errors: [] };
   // A ceiling on tags per night, so a first live night across the
   // enterprise stays inside the Worker's subrequest limit.
+  const perRepo = intSetting(
+    "BACKFILL_MAX_PER_REPO",
+    env.BACKFILL_MAX_PER_REPO,
+    10,
+    0,
+    1000,
+  );
   let remaining = intSetting(
     "NIGHTLY_MAX_TAGS",
     env.NIGHTLY_MAX_TAGS,
@@ -92,9 +99,18 @@ export async function nightly(
         name: repo.name,
         opts: { trigger: "nightly", live, maxTags: remaining },
       });
-      for (const c of report.channels) remaining -= c.created.length;
+      // A dry run spends what a live run would, so its night is a faithful
+      // preview of the live one.
+      for (const c of report.channels) {
+        remaining -= live ? c.created.length : c.planned.length;
+      }
+      remaining = Math.max(0, remaining);
       result.reports.push(report);
     } catch (e) {
+      // The run may have written before failing (scanRepo itself reports
+      // after writes; this is the RPC or the lock failing). Assume the worst
+      // for the budget: this repository may have used its full allowance.
+      remaining = Math.max(0, remaining - perRepo * 2);
       result.errors.push(
         `${repo.owner.login}/${repo.name}: ${e instanceof Error ? e.message : String(e)}`,
       );

@@ -12,7 +12,12 @@
 // runtime); this file is the runtime-free part, so it can be tested.
 
 import type { Env } from "./env";
-import { type RepoReport, type ScanOptions, scanRepo } from "./scan";
+import {
+  type ReleaseLedger,
+  type RepoReport,
+  type ScanOptions,
+  scanRepo,
+} from "./scan";
 
 /** A promise chain: run() calls start only after every earlier call settled. */
 export class Mutex {
@@ -29,7 +34,7 @@ export interface ScanRequest {
   token: string;
   owner: string;
   name: string;
-  opts: Omit<ScanOptions, "budget"> & { maxTags?: number };
+  opts: Omit<ScanOptions, "budget" | "ledger"> & { maxTags?: number };
 }
 
 /** The binding as this code uses it. */
@@ -63,10 +68,42 @@ export async function scanLocked(
 }
 
 /** The body of a run, inside the lock. */
-export function runScan(env: Env, req: ScanRequest): Promise<RepoReport> {
+export function runScan(
+  env: Env,
+  req: ScanRequest,
+  ledger?: ReleaseLedger,
+): Promise<RepoReport> {
   const { maxTags, ...opts } = req.opts;
   return scanRepo(env, req.token, req.owner, req.name, {
     ...opts,
     budget: maxTags === undefined ? undefined : { remaining: maxTags },
+    ledger,
   });
+}
+
+/** Minimal key-value storage, as a Durable Object's `ctx.storage` offers. */
+export interface KV {
+  get<T>(key: string): Promise<T | undefined>;
+  put<T>(key: string, value: T): Promise<void>;
+}
+
+/** The release ledger kept in the repository's own Durable Object storage. */
+export function storageLedger(storage: KV): ReleaseLedger {
+  const KEY = "pending-releases";
+  const read = async () => (await storage.get<string[]>(KEY)) ?? [];
+  return {
+    list: read,
+    async add(tag) {
+      const all = await read();
+      if (!all.includes(tag)) await storage.put(KEY, [...all, tag]);
+    },
+    async remove(tag) {
+      const all = await read();
+      if (all.includes(tag))
+        await storage.put(
+          KEY,
+          all.filter((t) => t !== tag),
+        );
+    },
+  };
 }

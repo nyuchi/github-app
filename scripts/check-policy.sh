@@ -32,4 +32,12 @@ while read -r repo sha path local; do
     status=1
   fi
 done < src/policy/POLICY_SOURCE
+# Every vendored file must be pinned: removing a line must not silently
+# unpin (and so fork) it.
+for required in src/policy/next-version.mjs src/policy/version-fixtures.json; do
+  if ! awk '{print $4}' src/policy/POLICY_SOURCE | grep -qxF "$required"; then
+    echo "::error::$required is not pinned in src/policy/POLICY_SOURCE." >&2
+    status=1
+  fi
+done
 exit "$status"

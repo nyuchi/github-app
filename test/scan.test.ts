@@ -822,90 +822,127 @@ test("history beyond the window with no tag in sight tags nothing (no stranded m
   }
 });
 
-// ---- Release repair --------------------------------------------------------
+// ---- Release repair (ledger) ---------------------------------------------
 
-test("release repair: an app-made, GitHub-verified tag without a release gets one", async () => {
+function memLedger(initial: string[] = []) {
+  let pending = [...initial];
+  return {
+    get pending() {
+      return pending;
+    },
+    list: async () => [...pending],
+    add: async (t: string) => {
+      if (!pending.includes(t)) pending.push(t);
+    },
+    remove: async (t: string) => {
+      pending = pending.filter((x) => x !== t);
+    },
+  };
+}
+
+test("a failed release is recorded in the ledger, then repaired on the next run", async () => {
+  const ledger = memLedger();
+  const fake = fakeGitHub({
+    tags: [{ name: "v0.0.9", commit: H("s4") }],
+    repo: { staging: null, workflows: tree() },
+  });
+  let failReleases = true;
+  const m = mockFetch((method, url, body) => {
+    if (method === "POST" && url.endsWith("/releases") && failReleases) {
+      return { status: 502, body: { message: "Bad Gateway" } };
+    }
+    if (method === "GET" && url.includes("/releases?")) return { body: [] };
+    return fake.route(method, url, body);
+  });
+  try {
+    const first = await scanRepo(testEnv(), "tok", "nyuchi", "x", {
+      ...nightly,
+      ledger,
+    });
+    assert.deepEqual(first.channels[0].created, ["v0.1.0", "v0.2.0", "v0.3.0"]);
+    assert.deepEqual(ledger.pending, ["v0.1.0", "v0.2.0", "v0.3.0"]);
+    failReleases = false;
+    const second = await scanRepo(testEnv(), "tok", "nyuchi", "x", {
+      ...nightly,
+      ledger,
+    });
+    assert.deepEqual(second.repaired, ["v0.1.0", "v0.2.0", "v0.3.0"]);
+    assert.deepEqual(ledger.pending, []);
+    const rel = m.calls
+      .filter((c) => c.method === "POST" && c.url.endsWith("/releases"))
+      .slice(-3);
+    assert.deepEqual(
+      rel.map((c) => (c.body as { make_latest: string }).make_latest),
+      ["false", "false", "true"],
+    );
+  } finally {
+    m.restore();
+  }
+});
+
+test("release repair: only ledger tags; a hand-made tag without a release is never touched", async () => {
+  const ledger = memLedger();
   const { m } = withFake({
     tags: [{ name: "v0.3.0", commit: H("m3"), message: APP_MSG("v0.3.0") }],
     repo: { staging: null, workflows: tree() },
     releaseExists: false,
   });
   try {
-    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", nightly);
-    const rel = m.calls.filter(
-      (c) => c.method === "POST" && c.url.endsWith("/releases"),
-    );
-    assert.equal(rel.length, 1);
-    assert.deepEqual(rel[0].body, {
-      tag_name: "v0.3.0",
-      name: "v0.3.0",
-      prerelease: false,
-      make_latest: "true",
-      generate_release_notes: true,
+    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", {
+      ...nightly,
+      ledger,
     });
-    assert.equal(r.channels[0].released, "v0.3.0");
+    assert.equal(r.repaired, undefined);
+    assert.equal(m.calls.filter((c) => c.url.includes("/releases")).length, 0);
   } finally {
     m.restore();
   }
 });
 
-test("release repair: a forged trailer is not provenance (unverified, or not the App's bot)", async () => {
-  for (const tagObject of [
-    { verified: false, email: BOT },
-    { verified: true, email: "attacker@example.com" },
-    { verified: true, email: "nyuchi[bot]@users.noreply.github.com" },
-  ]) {
-    const { m } = withFake({
-      tags: [{ name: "v0.3.0", commit: H("m3"), message: APP_MSG("v0.3.0") }],
-      repo: { staging: null, workflows: tree() },
-      releaseExists: false,
-      tagObject,
-    });
-    try {
-      await scanRepo(testEnv(), "tok", "nyuchi", "x", nightly);
-      assert.equal(
-        m.calls.filter((c) => c.url.includes("/releases")).length,
-        0,
-        JSON.stringify(tagObject),
-      );
-    } finally {
-      m.restore();
-    }
-  }
-});
-
-test("release repair: hand-made tags (no trailer) are never touched", async () => {
-  const { m } = withFake({
-    tags: [{ name: "v0.3.0", commit: H("m3"), message: "v0.3.0" }],
+test("release repair: an existing release, drafts included, clears the ledger without a duplicate", async () => {
+  const ledger = memLedger(["v0.3.0"]);
+  const fake = fakeGitHub({
+    tags: [{ name: "v0.3.0", commit: H("m3") }],
     repo: { staging: null, workflows: tree() },
-    releaseExists: false,
+  });
+  const m = mockFetch((method, url, body) => {
+    if (method === "GET" && url.includes("/releases?")) {
+      return { body: [{ tag_name: "v0.3.0", draft: true }] };
+    }
+    return fake.route(method, url, body);
   });
   try {
-    await scanRepo(testEnv(), "tok", "nyuchi", "x", nightly);
+    await scanRepo(testEnv(), "tok", "nyuchi", "x", { ...nightly, ledger });
     assert.equal(
-      m.calls.filter(
-        (c) => c.url.includes("/releases") || c.url.includes("/git/tags/"),
-      ).length,
+      m.calls.filter((c) => c.method === "POST" && c.url.endsWith("/releases"))
+        .length,
       0,
     );
+    assert.deepEqual(ledger.pending, []);
   } finally {
     m.restore();
   }
 });
 
-test("release repair: channel comes from the tag; staging betas never make a main release latest-less", async () => {
-  const { m, gh } = withFake({
+test("release repair: channel comes from the tag; staging betas do not take 'latest' from main", async () => {
+  const ledger = memLedger(["v1.2.5"]);
+  const fake = fakeGitHub({
     tags: [
       { name: "v1.2.5", commit: H("m3"), message: APP_MSG("v1.2.5", true) },
     ],
     repo: { staging: null, workflows: tree() },
-    releaseExists: false,
   });
+  const m = mockFetch((method, url, body) =>
+    method === "GET" && url.includes("/releases?")
+      ? { body: [] }
+      : fake.route(method, url, body),
+  );
   try {
-    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", {
+    await scanRepo(testEnv(), "tok", "nyuchi", "x", {
       trigger: "push",
       only: "main",
       live: true,
+      ledger,
     });
     const rel = m.calls.find(
       (c) => c.method === "POST" && c.url.endsWith("/releases"),
@@ -917,44 +954,117 @@ test("release repair: channel comes from the tag; staging betas never make a mai
       make_latest: "false",
       generate_release_notes: true,
     });
-    assert.equal(r.channels[0].released, "v1.2.5");
-    void gh;
   } finally {
     m.restore();
   }
-  // A main tag stays "latest" even when a higher STAGING beta exists.
-  const f2 = withFake({
+  const ledger2 = memLedger(["v1.3.0"]);
+  const fake2 = fakeGitHub({
     tags: [
       { name: "v1.3.0", commit: H("m3"), message: APP_MSG("v1.3.0") },
       { name: "v1.3.1", commit: H("s9"), message: APP_MSG("v1.3.1", true) },
     ],
     repo: { staging: null, workflows: tree() },
-    releaseExists: false,
   });
+  const m2 = mockFetch((method, url, body) =>
+    method === "GET" && url.includes("/releases?")
+      ? { body: [] }
+      : fake2.route(method, url, body),
+  );
   try {
-    await scanRepo(testEnv(), "tok", "nyuchi", "x", nightly);
-    const rel = f2.m.calls.find(
+    await scanRepo(testEnv(), "tok", "nyuchi", "x", {
+      ...nightly,
+      ledger: ledger2,
+    });
+    const rel = m2.calls.find(
       (c) => c.method === "POST" && c.url.endsWith("/releases"),
     )!;
     assert.equal((rel.body as { make_latest: string }).make_latest, "true");
   } finally {
-    f2.m.restore();
+    m2.restore();
   }
 });
 
-test("release repair is reported, not made, in a dry run", async () => {
-  const { m } = withFake({
-    tags: [{ name: "v0.3.0", commit: H("m3"), message: APP_MSG("v0.3.0") }],
+test("release repair: a release list that cannot be read in full leaves the ledger alone", async () => {
+  const ledger = memLedger(["v0.3.0"]);
+  const fake = fakeGitHub({
+    tags: [{ name: "v0.3.0", commit: H("m3") }],
     repo: { staging: null, workflows: tree() },
-    releaseExists: false,
+  });
+  const m = mockFetch((method, url, body) => {
+    if (method === "GET" && url.includes("/releases")) {
+      return {
+        body: [{ tag_name: "other" }],
+        headers: { link: '<https://api.github.test/next>; rel="next"' },
+      };
+    }
+    return fake.route(method, url, body);
   });
   try {
+    await scanRepo(testEnv(), "tok", "nyuchi", "x", { ...nightly, ledger });
+    assert.equal(
+      m.calls.filter((c) => c.method === "POST" && c.url.endsWith("/releases"))
+        .length,
+      0,
+    );
+    assert.deepEqual(ledger.pending, ["v0.3.0"]);
+  } finally {
+    m.restore();
+  }
+});
+
+test("fail closed: a history page without pageInfo is an error, not 'complete'", async () => {
+  const { m } = withFake({
+    tags: [{ name: "v0.0.9", commit: H("s4") }],
+    repo: {
+      staging: null,
+      defaultBranchRef: {
+        name: "main",
+        target: { history: { nodes: [node("m1", 1)] } },
+      },
+    },
+  });
+  try {
+    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", nightly);
+    assert.equal(writes(m.calls).length, 0);
+    assert.match(r.errors.join(" "), /history of main could not be read/);
+  } finally {
+    m.restore();
+  }
+});
+
+test("the branch check names the branch unambiguously (heads/<branch>)", async () => {
+  const { m } = withFake({
+    tags: [{ name: "v0.0.9", commit: H("s4") }],
+    repo: { staging: null },
+  });
+  try {
+    await scanRepo(testEnv(), "tok", "nyuchi", "x", nightly);
+    const cmp = m.calls.filter((c) => c.url.includes("/compare/"));
+    assert.ok(cmp.length > 0);
+    for (const c of cmp) assert.match(c.url, /\.\.\.heads\/main$/);
+  } finally {
+    m.restore();
+  }
+});
+
+test("a dry run applies the budget, so its report matches a live night", async () => {
+  const { m } = withFake({
+    tags: [{ name: "v0.0.9", commit: H("s4") }],
+    repo: { staging: null },
+  });
+  try {
+    const budget = { remaining: 2 };
     const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", {
       trigger: "nightly",
       live: false,
+      budget,
     });
-    assert.equal(writes(m.calls).length, 0);
-    assert.match(summarise(r) ?? "", /release for v0\.3\.0/);
+    assert.deepEqual(
+      r.channels[0].planned.map((t) => t.tag),
+      ["v0.1.0", "v0.2.0"],
+    );
+    assert.equal(r.channels[0].pending, 1);
+    assert.equal(budget.remaining, 0);
   } finally {
     m.restore();
   }

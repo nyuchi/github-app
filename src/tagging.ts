@@ -208,28 +208,59 @@ export interface WorkflowFacts {
  * - `workflow_run`, which can chain off a run that a tag started.
  */
 export function startsOnTagOrRelease(on: unknown): boolean {
-  const TAG_EVENTS = ["release", "create", "workflow_run", "push"];
-  if (typeof on === "string") return TAG_EVENTS.includes(on);
-  if (Array.isArray(on)) return on.some((e) => TAG_EVENTS.includes(String(e)));
+  // An ALLOWLIST: events that never fire for a tag push or a release. Any
+  // other event (a new one, a misspelling, `release`, `create`,
+  // `workflow_run`, ...) counts as one that can. `push` is judged by its
+  // filters below.
+  const SAFE = new Set([
+    "pull_request",
+    "pull_request_target",
+    "pull_request_review",
+    "pull_request_review_comment",
+    "merge_group",
+    "schedule",
+    "workflow_dispatch",
+    "workflow_call",
+    "repository_dispatch",
+    "issues",
+    "issue_comment",
+    "discussion",
+    "discussion_comment",
+    "label",
+    "milestone",
+    "check_run",
+    "check_suite",
+    "status",
+    "watch",
+    "fork",
+    "gollum",
+    "page_build",
+    "branch_protection_rule",
+  ]);
+  const pushRunsForTags = (p: unknown): boolean => {
+    if (!p || typeof p !== "object" || Array.isArray(p)) return true; // bare `push`
+    const f = p as Record<string, unknown>;
+    if ("tags" in f || "tags-ignore" in f) return true;
+    // Only a real filter (a non-empty string or list) limits a push to
+    // branches; `branches:` with no value is as good as absent.
+    const real = (v: unknown) =>
+      (typeof v === "string" && v.length > 0) ||
+      (Array.isArray(v) && v.length > 0);
+    return !real(f.branches) && !real(f["branches-ignore"]);
+  };
+  const event = (name: string, value: unknown): boolean =>
+    name === "push" ? pushRunsForTags(value) : !SAFE.has(name);
+  if (typeof on === "string") return event(on, null);
+  if (Array.isArray(on)) {
+    return on.some((e) => typeof e !== "string" || event(e, null));
+  }
   if (on && typeof on === "object") {
-    const o = on as Record<string, unknown>;
-    if ("release" in o || "create" in o || "workflow_run" in o) return true;
-    if ("push" in o) {
-      const p = o.push;
-      if (!p || typeof p !== "object") return true; // bare `push:`
-      const f = p as Record<string, unknown>;
-      if ("tags" in f || "tags-ignore" in f) return true;
-      // Only a real filter (a non-empty string or list) limits a push to
-      // branches; `branches:` with no value is as good as absent.
-      const real = (v: unknown) =>
-        (typeof v === "string" && v.length > 0) ||
-        (Array.isArray(v) && v.length > 0);
-      if (!real(f.branches) && !real(f["branches-ignore"])) return true;
-    }
-    return false;
+    return Object.entries(on as Record<string, unknown>).some(([k, v]) =>
+      event(k, v),
+    );
   }
   // Anything unrecognised (a number, `true` from a YAML 1.1 `on`): unsure.
-  return on !== undefined && on !== null;
+  return true;
 }
 
 /** Read the facts from the text of each `.github/workflows/*.yml`. */
