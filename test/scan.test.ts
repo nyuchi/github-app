@@ -21,14 +21,8 @@ const short = (name: string) => H(name).slice(0, 7);
 /** The (hex) id of the annotated tag object for a tag name. */
 const O = (tag: string) => H(`obj-${tag}`);
 
-const node = (
-  name: string,
-  pr: number | null,
-  base = "main",
-  committedDate = "2026-09-15T00:00:00Z",
-) => ({
+const node = (name: string, pr: number | null, base = "main") => ({
   oid: H(name),
-  committedDate,
   associatedPullRequests: {
     nodes: pr === null ? [] : [{ number: pr, merged: true, baseRefName: base }],
   },
@@ -75,8 +69,8 @@ interface FakeOpts {
   unprotected?: boolean;
   /** Override the tag object a REST ref read reports, per tag name. */
   refObject?: Record<string, string>;
-  /** When the branch last moved (GitHub's activity record). */
-  branchMovedAt?: string;
+  /** GitHub's activity record for the ref, newest first. */
+  activity?: { timestamp: string; before: string }[];
 }
 
 /**
@@ -179,7 +173,9 @@ function fakeGitHub(opts: FakeOpts) {
       }
       if (method === "GET" && url.includes("/activity?")) {
         return {
-          body: [{ timestamp: opts.branchMovedAt ?? "2026-09-15T00:00:00Z" }],
+          body: opts.activity ?? [
+            { timestamp: "2026-09-15T00:00:00Z", before: "0".repeat(40) },
+          ],
         };
       }
       if (method === "GET" && url.includes("/rules/branches/")) {
@@ -266,8 +262,8 @@ test("toCommits prefers the PR merged into this branch; toTagRef peels to the co
   assert.deepEqual(
     toCommits({ name: "x" }, [node("a", 1, "x"), node("b", null)]),
     [
-      { oid: H("a"), pr: 1, committedDate: "2026-09-15T00:00:00Z" },
-      { oid: H("b"), pr: null, committedDate: "2026-09-15T00:00:00Z" },
+      { oid: H("a"), pr: 1 },
+      { oid: H("b"), pr: null },
     ],
   );
   assert.deepEqual(
@@ -811,7 +807,7 @@ test("fail closed: a version tag that does not resolve to a commit skips the rep
   }
 });
 
-test("fail closed: on push, a commit whose PR is not indexed yet (and newer) waits", async () => {
+test("fail closed: on push, a commit whose PR is not indexed yet holds the channel", async () => {
   const { gh, m } = withFake({
     tags: [{ name: "v0.0.9", commit: H("s4") }],
     repo: {
@@ -834,14 +830,10 @@ test("fail closed: on push, a commit whose PR is not indexed yet (and newer) wai
       live: true,
       ledger: memLedger(),
     });
-    // The unindexed commit (and anything newer) waits; the older merge is
-    // tagged.
-    assert.deepEqual(r.channels[0].created, ["v0.1.0"]);
+    // The whole channel waits, so one merge is never split.
+    assert.equal(writes(m.calls).length, 0);
     assert.match(r.channels[0].note ?? "", /not indexed yet/);
-    assert.equal(
-      gh.tags.some((t) => t.commit === H("m2")),
-      false,
-    );
+    assert.equal(gh.tags.length, 1);
   } finally {
     m.restore();
   }
@@ -1374,12 +1366,10 @@ test("a commit merged into another branch (a back-merge) is not a release of thi
     oid: H("backmerged"),
     pr: null,
     foreign: true,
-    committedDate: "2026-09-15T00:00:00Z",
   });
   assert.deepEqual(commits[1], {
     oid: H("feature"),
     pr: 31,
-    committedDate: "2026-09-15T00:00:00Z",
   });
 });
 
@@ -1568,65 +1558,91 @@ test("with the budget spent, a channel is not even read", async () => {
   }
 });
 
-test("grace: a PR-less commit on a branch that just moved waits, older merges are still tagged", async () => {
-  const mk = (movedAt: string) =>
+test("night: a PR-less commit that arrived within the hour holds the channel; an older one does not", async () => {
+  const history = [node("m3", 30), node("direct", null), node("m1", 10)];
+  const mk = (activity: { timestamp: string; before: string }[]) =>
     withFake({
       tags: [{ name: "v0.0.9", commit: H("s4") }],
-      branchMovedAt: movedAt,
+      activity,
       repo: {
         staging: null,
         defaultBranchRef: {
           name: "main",
           target: {
-            history: {
-              pageInfo: { hasNextPage: false },
-              // newest first: an unindexed direct push on top of two merges
-              nodes: [node("direct", null), node("m2", 20), node("m1", 10)],
-            },
+            history: { pageInfo: { hasNextPage: false }, nodes: history },
           },
         },
       },
     });
-  const recent = mk(new Date(Date.now() - 5 * 60_000).toISOString());
+  const minutesAgo = (n: number) =>
+    new Date(Date.now() - n * 60_000).toISOString();
+  // "direct" arrived 5 minutes ago (the branch moved from m1 to it).
+  const a = mk([
+    { timestamp: minutesAgo(2), before: H("direct") },
+    { timestamp: minutesAgo(5), before: H("m1") },
+  ]);
   try {
     const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", live());
-    assert.deepEqual(r.channels[0].created, ["v0.1.0", "v0.2.0"]);
-    assert.match(r.channels[0].note ?? "", /not indexed yet/);
-    assert.equal(
-      recent.gh.tags.some((t) => t.commit === H("direct")),
-      false,
-    );
+    assert.equal(writes(a.m.calls).length, 0);
+    assert.match(r.channels[0].note ?? "", /channel waits/);
   } finally {
-    recent.m.restore();
+    a.m.restore();
   }
-  const quiet = mk("2026-09-15T00:00:00Z");
+  // Only m3 arrived recently; "direct" is older: tag everything.
+  const b = mk([
+    { timestamp: minutesAgo(2), before: H("direct") },
+    { timestamp: minutesAgo(600), before: H("m1") },
+  ]);
   try {
     const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", live());
     assert.deepEqual(r.channels[0].created, ["v0.1.0", "v0.2.0", "v0.3.0"]);
   } finally {
-    quiet.m.restore();
+    b.m.restore();
+  }
+  // A "before" outside the history read: cannot place it, so it waits.
+  const c = mk([{ timestamp: minutesAgo(2), before: H("elsewhere") }]);
+  try {
+    await scanRepo(testEnv(), "tok", "nyuchi", "x", live());
+    assert.equal(writes(c.m.calls).length, 0);
+  } finally {
+    c.m.restore();
   }
 });
 
-test("repair: a permanently failing entry is dropped after bounded attempts", async () => {
-  const ledger = memLedger([entry("v0.3.0", H("m3"), { attempts: 9 })]);
-  const fake = fakeGitHub({
-    tags: [{ name: "v0.3.0", commit: H("m3") }],
-    repo: { staging: null, workflows: tree() },
-  });
-  const m = mockFetch((method, url, body) => {
-    if (method === "GET" && url.includes("/releases?")) return { body: [] };
-    if (method === "POST" && url.endsWith("/releases"))
-      return { status: 422, body: { message: "Validation Failed" } };
-    return fake.route(method, url, body);
-  });
-  try {
-    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", live({ ledger }));
-    assert.deepEqual(ledger.pending, []);
-    assert.match(r.errors.join(" "), /giving up after 10 attempts/);
-  } finally {
-    m.restore();
-  }
+test("repair: transient failures never count; a permanent one is dropped after bounded runs", async () => {
+  const run = async (status: number, attempts: number) => {
+    const ledger = memLedger([entry("v0.3.0", H("m3"), { attempts })]);
+    const fake = fakeGitHub({
+      tags: [{ name: "v0.3.0", commit: H("m3") }],
+      repo: { staging: null, workflows: tree() },
+    });
+    const m = mockFetch((method, url, body) => {
+      if (method === "GET" && url.includes("/releases?")) return { body: [] };
+      if (method === "POST" && url.endsWith("/releases"))
+        return { status, body: { message: "x" } };
+      return fake.route(method, url, body);
+    });
+    try {
+      const r = await scanRepo(
+        testEnv(),
+        "tok",
+        "nyuchi",
+        "x",
+        live({ ledger }),
+      );
+      return { ledger: await ledger.list(), errors: r.errors.join(" ") };
+    } finally {
+      m.restore();
+    }
+  };
+  const transient = await run(502, 9);
+  assert.equal(transient.ledger[0]?.attempts, 9, "a 5xx does not count");
+  assert.match(transient.errors, /will retry/);
+  const limited = await run(403, 9);
+  assert.equal(limited.ledger[0]?.attempts, 9, "a rate limit does not count");
+  const permanent = await run(422, 9);
+  assert.deepEqual(permanent.ledger, []);
+  assert.match(permanent.errors, /giving up after 10 runs/);
 });
 
 test("repair: one entry's failure does not block the others", async () => {

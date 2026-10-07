@@ -43,10 +43,11 @@ This Worker only decides **which commits are releases**:
   only pull requests merged into another branch (it reached this one by a
   fast-forward) is not a release of this branch and is never tagged on it.
   A back-merge made through its own pull request into this branch is a
-  release like any other. A commit without an indexed pull request, and
-  anything newer, waits for a later run while the branch moved within the
-  last hour (GitHub's activity record for the ref); older merges are still
-  tagged.
+  release like any other. If a commit without an indexed pull request may
+  have just arrived, the whole channel waits for a later run, so one rebase
+  merge is never split. On push it always waits. At night it waits when
+  GitHub's activity record for the ref shows the commit arrived within the
+  last hour, or cannot say.
 - Releases are tagged oldest first, each at the next version above the highest
   existing tag. Only the newest default-branch release is marked "latest".
 - At most `BACKFILL_MAX_PER_REPO` tags per channel (branch) per run, and

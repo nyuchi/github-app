@@ -36,8 +36,6 @@ export interface Commit {
    * change to this branch and is released like any other.
    */
   foreign?: boolean;
-  /** When the commit was made (ISO), for the nightly grace window. */
-  committedDate?: string;
 }
 
 export interface TagRef {

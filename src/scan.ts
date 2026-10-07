@@ -41,7 +41,6 @@ const HISTORY_NODES = `
   pageInfo { hasNextPage endCursor }
   nodes {
     oid
-    committedDate
     associatedPullRequests(first: 5) { nodes { number merged baseRefName } }
   }`;
 
@@ -120,7 +119,6 @@ const MAX_TAG_PAGES = 51;
 
 interface HistoryNode {
   oid: string;
-  committedDate?: string;
   associatedPullRequests?: {
     nodes: { number: number; merged: boolean; baseRefName?: string }[];
   };
@@ -302,14 +300,13 @@ export function toCommits(
     const merged = (n.associatedPullRequests?.nodes ?? []).filter(
       (p) => p.merged,
     );
-    const at = n.committedDate ? { committedDate: n.committedDate } : {};
     const here = merged.find((p) => p.baseRefName === branch);
-    if (here) return { oid: n.oid, pr: here.number, ...at };
+    if (here) return { oid: n.oid, pr: here.number };
     // Merged only into other branches: it reached this branch some other
     // way (a fast-forward of another branch's commit), so it is not a
     // release of this branch.
-    if (merged.length) return { oid: n.oid, pr: null, foreign: true, ...at };
-    return { oid: n.oid, pr: null, ...at };
+    if (merged.length) return { oid: n.oid, pr: null, foreign: true };
+    return { oid: n.oid, pr: null };
   });
 }
 
@@ -602,35 +599,40 @@ async function scanChannel(
 
   // A merge whose pull request GitHub has not indexed yet looks like a
   // direct push, and would split one rebase merge into several versions.
-  // Such a commit, and everything newer, waits; the older merges are still
-  // planned. On push it always waits (its index may lag by seconds). At
-  // night it waits only while the branch moved within the last hour (when
-  // it reached the branch matters, not when it was committed), read from
-  // GitHub's own record of pushes to the ref.
-  let walk = history.commits;
+  // So if any such commit may have ARRIVED recently, the whole channel waits
+  // (planning only the older part could still split a merge whose commits
+  // are indexed one at a time). On push, everything just arrived. At night,
+  // GitHub's activity record for the ref says which commits arrived within
+  // the last hour; anything it cannot place counts as recent.
   const prless = history.untagged.filter((x) => x.pr === null && !x.foreign);
   if (prless.length) {
     const recent =
       opts.trigger === "push" ||
-      (await branchMovedWithin(env, token, owner, name, node.name, 3_600_000));
+      (await arrivedRecently(
+        env,
+        token,
+        owner,
+        name,
+        node.name,
+        history.commits,
+        prless,
+        3_600_000,
+      ));
     if (recent) {
-      const oldest = prless[prless.length - 1];
-      walk = history.commits.slice(
-        history.commits.findIndex((x) => x.oid === oldest.oid) + 1,
-      );
       entry.note =
-        "a new commit's pull request is not indexed yet; it and anything newer wait for the next run";
+        "a commit's pull request is not indexed yet, or it just arrived; the channel waits for a later run";
+      entry.pending = history.untagged.length;
+      return;
     }
   }
 
   const plan = planBranch({
     channel,
-    history: walk,
+    history: history.commits,
     tags,
     prefix,
     max: c.max,
   });
-  if (!plan.tags.length && entry.note) return;
 
   // The default branch's workflows were checked above. A tag push runs the
   // workflows AT THE TAGGED COMMIT, so every commit about to be tagged is
@@ -660,8 +662,7 @@ async function scanChannel(
     return;
   }
   entry.planned = plan.tags;
-  entry.note =
-    [entry.note, plan.stopped].filter(Boolean).join("; ") || undefined;
+  entry.note = plan.stopped;
 
   if (!opts.live) {
     // A dry run applies the same budget and counts its planned tags as made,
@@ -789,32 +790,54 @@ export async function branchIsProtected(
 }
 
 /**
- * Did the branch move within the last `ms`? GitHub's activity record for the
- * ref (pushes and merges, newest first). Unknown counts as yes (wait).
+ * Did any of `subjects` reach the branch within the last `ms`? GitHub's
+ * activity record for the ref lists each push or merge, newest first, with
+ * the commit the branch moved from (`before`). Every commit newer than the
+ * oldest `before` among recent events arrived recently. Anything that cannot
+ * be placed counts as recent.
  */
-export async function branchMovedWithin(
+export async function arrivedRecently(
   env: Env,
   token: string,
   owner: string,
   name: string,
   branch: string,
+  history: Commit[],
+  subjects: Commit[],
   ms: number,
 ): Promise<boolean> {
+  let body: unknown;
   try {
-    const { body } = await gh(
+    ({ body } = await gh(
       env,
       token,
-      `/repos/${owner}/${name}/activity?ref=${encodeURIComponent(`refs/heads/${branch}`)}&per_page=1`,
-    );
-    const at = Array.isArray(body)
-      ? (body[0] as { timestamp?: unknown } | undefined)?.timestamp
-      : undefined;
-    const t = typeof at === "string" ? Date.parse(at) : NaN;
-    if (!Number.isFinite(t)) return true;
-    return Date.now() - t < ms;
+      `/repos/${owner}/${name}/activity?ref=${encodeURIComponent(`refs/heads/${branch}`)}&per_page=100`,
+    ));
   } catch {
     return true;
   }
+  if (!Array.isArray(body)) return true;
+  const now = Date.now();
+  const befores: string[] = [];
+  for (const ev of body as { timestamp?: unknown; before?: unknown }[]) {
+    const t =
+      typeof ev?.timestamp === "string" ? Date.parse(ev.timestamp) : NaN;
+    if (!Number.isFinite(t)) return true;
+    if (now - t >= ms) break; // newest first: the rest are older
+    if (typeof ev.before !== "string") return true;
+    befores.push(ev.before);
+  }
+  if (!befores.length) return false;
+  // Commits above the oldest recent "before" in the linear history arrived
+  // within the window. A "before" outside the history read: assume recent.
+  let cut = -1;
+  for (const b of befores) {
+    const k = history.findIndex((x) => x.oid === b);
+    if (k < 0) return true;
+    cut = Math.max(cut, k);
+  }
+  const recent = new Set(history.slice(0, cut).map((x) => x.oid));
+  return subjects.some((x) => recent.has(x.oid));
 }
 
 /** Is `commit` the head of `branch` or an ancestor of it? */
@@ -1057,45 +1080,70 @@ export async function repairReleases(
   const live = versionTags(fresh, prefix);
   const repaired: string[] = [];
   for (const e of pending) {
+    let outcome: "done" | "stuck" | "transient";
+    let why = "";
     try {
-      if (await repairOne(e)) repaired.push(e.tag);
+      outcome = await repairOne(e);
     } catch (err) {
-      // One entry's failure never blocks the others. A permanent failure
-      // is retried a bounded number of times, then dropped and reported.
+      why = msg(err);
+      // Rate limits, 5xx and network trouble are not the entry's fault and
+      // never count towards giving up. Anything else (a validation error)
+      // does.
+      const st = err instanceof AppError ? err.status : 0;
+      outcome =
+        st === 0 || st === 403 || st === 429 || st >= 500
+          ? "transient"
+          : "stuck";
+    }
+    if (outcome === "done") continue;
+    if (outcome === "transient") {
+      if (why) errors.push(`release for ${e.tag} (will retry): ${why}`);
+      continue;
+    }
+    // Stuck (a permanent error, or a proof that keeps failing): bounded.
+    try {
       const attempts = (e.attempts ?? 0) + 1;
       if (attempts >= MAX_REPAIR_ATTEMPTS) {
         await ledger.remove(e.tag);
         errors.push(
-          `release for ${e.tag}: giving up after ${attempts} attempts: ${msg(err)}`,
+          `release for ${e.tag}: giving up after ${attempts} runs${why ? `: ${why}` : ""}`,
         );
       } else {
         await ledger.add({ ...e, attempts });
-        errors.push(`release for ${e.tag} (attempt ${attempts}): ${msg(err)}`);
+        if (why) errors.push(`release for ${e.tag} (run ${attempts}): ${why}`);
       }
+    } catch (le) {
+      errors.push(
+        `release for ${e.tag}: could not update the ledger: ${msg(le)}`,
+      );
     }
   }
   return repaired;
 
-  async function repairOne(e: LedgerEntry): Promise<boolean> {
+  // done: released, or nothing left to do; stuck: a proof failed (try again
+  // later, but not forever); transient: GitHub could not answer.
+  async function repairOne(
+    e: LedgerEntry,
+  ): Promise<"done" | "stuck" | "transient"> {
     // The ref through REST, which is consistent with this app's own REST
     // writes (a GraphQL read may lag behind them).
     const ref = await tagRef(env, token, owner, name, e.tag);
     if (ref === "absent") {
       await ledger.remove(e.tag); // never created, or deleted: nothing to do
-      return false;
+      return "done";
     }
-    if (ref === null) return false; // unknown: try again later
+    if (ref === null) return "transient";
     if (ref.type !== "tag" || ref.sha !== e.object) {
       // Re-made by someone else (a different object), even under our name.
       await ledger.remove(e.tag);
-      return false;
+      return "done";
     }
     // A tag object's sha is the hash of its content, so the recorded object
     // still names the recorded commit.
-    if (releases === null) return false;
+    if (releases === null) return "transient";
     if (releases.has(e.tag)) {
       await ledger.remove(e.tag);
-      return false;
+      return "done";
     }
     let reachable = false;
     for (const b of protectedBranches) {
@@ -1104,8 +1152,8 @@ export async function repairReleases(
         break;
       }
     }
-    if (!reachable) return false;
-    if (facts.get(e.commit)?.publishesOnTag !== false) return false;
+    if (!reachable) return "stuck";
+    if (facts.get(e.commit)?.publishesOnTag !== false) return "stuck";
     // Latest only if, as recorded, it was the newest default-branch release
     // AND no higher non-beta version tag has appeared since.
     const version = e.tag.slice(prefix.length);
@@ -1120,7 +1168,8 @@ export async function repairReleases(
       pr: e.pr,
     });
     await ledger.remove(e.tag);
-    return true;
+    repaired.push(e.tag);
+    return "done";
   }
 }
 
