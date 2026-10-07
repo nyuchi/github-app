@@ -49,11 +49,11 @@ query Repo($owner: String!, $name: String!, $staging: String!, $hist: Int!, $sin
       pageInfo { hasNextPage endCursor }
       nodes {
         name
-        target { __typename oid ... on Tag { target { oid } } }
+        target { __typename oid ... on Tag { message target { oid } } }
       }
     }
     workflows: object(expression: "HEAD:.github/workflows") {
-      ... on Tree { entries { name object { ... on Blob { text isBinary } } } }
+      ... on Tree { entries { name object { ... on Blob { text isBinary isTruncated } } } }
     }
   }
 }`;
@@ -85,7 +85,7 @@ query Tags($owner: String!, $name: String!, $tagsAfter: String) {
   repository(owner: $owner, name: $name) {
     tags: refs(refPrefix: "refs/tags/", first: 100, after: $tagsAfter) {
       pageInfo { hasNextPage endCursor }
-      nodes { name target { __typename oid ... on Tag { target { oid } } } }
+      nodes { name target { __typename oid ... on Tag { message target { oid } } } }
     }
   }
 }`;
@@ -106,7 +106,12 @@ interface BranchNode {
 }
 interface TagNode {
   name: string;
-  target: { __typename: string; oid: string; target?: { oid: string } };
+  target: {
+    __typename: string;
+    oid: string;
+    message?: string;
+    target?: { oid: string };
+  };
 }
 interface TagPage {
   pageInfo: { hasNextPage: boolean; endCursor: string | null };
@@ -115,7 +120,11 @@ interface TagPage {
 interface RepoTree {
   entries?: {
     name: string;
-    object?: { text?: string | null; isBinary?: boolean };
+    object?: {
+      text?: string | null;
+      isBinary?: boolean;
+      isTruncated?: boolean;
+    };
   }[];
 }
 interface RepoData {
@@ -130,7 +139,11 @@ interface RepoData {
     workflows: {
       entries?: {
         name: string;
-        object?: { text?: string | null; isBinary?: boolean };
+        object?: {
+          text?: string | null;
+          isBinary?: boolean;
+          isTruncated?: boolean;
+        };
       }[];
     } | null;
   } | null;
@@ -160,6 +173,9 @@ export function toCommits(
 export function toTagRef(n: TagNode): TagRef {
   return {
     name: n.name,
+    ...(typeof n.target.message === "string"
+      ? { message: n.target.message }
+      : {}),
     commit:
       n.target.__typename === "Tag" && n.target.target
         ? n.target.target.oid
@@ -177,6 +193,8 @@ export interface RepoReport {
     created: string[];
     pending: number;
     note?: string;
+    /** A release made (or, dry run, to be made) for an existing app tag. */
+    released?: string;
   }[];
   errors: string[];
 }
@@ -190,12 +208,62 @@ export interface ScanOptions {
   budget?: { remaining: number };
 }
 
-const sinceIso = (env: Env) => {
-  const d = env.BACKFILL_SINCE ? new Date(env.BACKFILL_SINCE) : new Date(0);
-  return Number.isNaN(d.getTime())
-    ? new Date(0).toISOString()
-    : d.toISOString();
+/**
+ * BACKFILL_SINCE as an ISO timestamp. FAIL CLOSED: unset or unparseable
+ * stops tagging for the repository rather than widening the window to all
+ * history (a typo must not tag years of merges).
+ */
+export const sinceIso = (env: Env): string => {
+  const raw = (env.BACKFILL_SINCE ?? "").trim();
+  const d = new Date(raw);
+  if (!raw || Number.isNaN(d.getTime())) {
+    throw new AppError(
+      `BACKFILL_SINCE is ${raw ? `not a date ("${raw}")` : "unset"}; not tagging`,
+      500,
+    );
+  }
+  return d.toISOString();
 };
+
+/**
+ * A whole-number setting. Unset or empty takes the default; anything else
+ * must be an integer in range, or tagging stops (a typo must not quietly
+ * become a different limit).
+ */
+export function intSetting(
+  name: string,
+  raw: string | undefined,
+  def: number,
+  min: number,
+  max: number,
+): number {
+  if (raw === undefined || raw.trim() === "") return def;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < min || n > max) {
+    throw new AppError(
+      `${name} must be an integer ${min}..${max}, got "${raw}"`,
+      500,
+    );
+  }
+  return n;
+}
+
+/** Workflow entries of a tree as classifyWorkflows takes them. */
+function treeFiles(
+  entries: RepoTree["entries"],
+): { name: string; text: string | null }[] {
+  return (entries ?? []).map((e) => ({
+    name: e.name,
+    // Binary, truncated or not a blob (a submodule): unreadable -> publishing.
+    text:
+      e.object &&
+      !e.object.isBinary &&
+      !e.object.isTruncated &&
+      typeof e.object.text === "string"
+        ? e.object.text
+        : null,
+  }));
+}
 
 /** Plan, and in live mode apply, the tags one repository is missing. */
 export async function scanRepo(
@@ -212,15 +280,22 @@ export async function scanRepo(
 
   const prefix = env.TAG_PREFIX || "v";
   const stagingName = env.STAGING_BRANCH || "staging";
-  const hist = Math.min(100, Math.max(1, Number(env.SCAN_HISTORY) || 50));
-  const max = Math.max(0, Number(env.BACKFILL_MAX_PER_REPO) || 10);
+  const hist = intSetting("SCAN_HISTORY", env.SCAN_HISTORY, 50, 1, 100);
+  const max = intSetting(
+    "BACKFILL_MAX_PER_REPO",
+    env.BACKFILL_MAX_PER_REPO,
+    10,
+    0,
+    1000,
+  );
+  const since = sinceIso(env);
 
   const data = await graphql<RepoData>(env, token, REPO_QUERY, {
     owner,
     name,
     staging: `refs/heads/${stagingName}`,
     hist,
-    since: sinceIso(env),
+    since,
     tagsAfter: null,
   });
   const r = data.repository;
@@ -235,10 +310,7 @@ export async function scanRepo(
   }
 
   const facts: WorkflowFacts = classifyWorkflows(
-    (r.workflows?.entries ?? []).map((e) => ({
-      name: e.name,
-      text: e.object && !e.object.isBinary ? (e.object.text ?? null) : null,
-    })),
+    treeFiles(r.workflows?.entries),
   );
 
   const branches: { channel: Channel; node: BranchNode | null }[] = [
@@ -313,22 +385,25 @@ export async function scanRepo(
     }
     const created: string[] = [];
     let note = plan.stopped;
+    let released: string | null = null;
+    try {
+      // Reported in dry runs too, so the dry-run night shows it.
+      released = await repairRelease(
+        env,
+        token,
+        owner,
+        name,
+        history.stop,
+        tags,
+        prefix,
+        opts.live,
+      );
+    } catch (e) {
+      report.errors.push(
+        `release for ${history.stop?.name}: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
     if (opts.live) {
-      try {
-        await repairRelease(
-          env,
-          token,
-          owner,
-          name,
-          channel,
-          history.stop,
-          prefix,
-        );
-      } catch (e) {
-        report.errors.push(
-          `release for ${history.stop?.name}: ${e instanceof Error ? e.message : String(e)}`,
-        );
-      }
       for (const t of plan.tags) {
         if (opts.budget && opts.budget.remaining <= 0) {
           note = "tonight's tag budget is spent; continues next run";
@@ -362,6 +437,7 @@ export async function scanRepo(
       pending:
         plan.pending + (opts.live ? plan.tags.length - created.length : 0),
       note,
+      ...(released ? { released } : {}),
     });
   }
   return report;
@@ -413,46 +489,82 @@ export async function readHistory(
   };
 }
 
+/** The trailer every tag this app makes carries, and the beta marker. */
+export const TAGGED_BY = "Tagged-by: nyuchi-github-app";
+const STAGING_MARK = "(staging)";
+
+export function tagMessage(t: Pick<PlannedTag, "tag" | "channel">): string {
+  return `${t.tag}${t.channel === "staging" ? ` ${STAGING_MARK}` : ""}\n\n${TAGGED_BY}\n`;
+}
+
+/** The one release body both paths (new tag, repair) send. */
+export async function createRelease(
+  env: Env,
+  token: string,
+  repo: string,
+  r: { tag: string; prerelease: boolean; latest: boolean },
+): Promise<void> {
+  await gh(env, token, `/repos/${repo}/releases`, {
+    method: "POST",
+    body: JSON.stringify({
+      tag_name: r.tag,
+      name: r.prerelease ? `${r.tag} (beta)` : r.tag,
+      prerelease: r.prerelease,
+      make_latest: r.latest ? "true" : "false",
+      generate_release_notes: true,
+    }),
+  });
+}
+
 /**
- * The newest tag on a branch must have its GitHub release. A run that made
- * the tag but failed on the release would otherwise never retry it: the next
- * walk stops at that tag. Skipped when that commit's workflows would start
- * on a release.
+ * A tag THIS APP made, whose release creation failed, gets its release on a
+ * later run (the walk stops at that tag, so it would otherwise never be
+ * retried). Only tags carrying TAGGED_BY are touched: tags made by hand or
+ * by a repository's own workflow are left as they are. Channel and "latest"
+ * come from the tag itself, not from the branch being walked.
+ *
+ * Returns the tag name when a release is (or, in a dry run, would be) made.
  */
 export async function repairRelease(
   env: Env,
   token: string,
   owner: string,
   name: string,
-  channel: Channel,
   tag: TagRef | undefined,
+  tags: TagRef[],
   prefix: string,
-): Promise<boolean> {
-  if (!tag || !versionTags([tag], prefix).length) return false;
+  live: boolean,
+): Promise<string | null> {
+  if (!tag?.message?.includes(TAGGED_BY)) return null;
+  if (!versionTags([tag], prefix).length) return null;
   try {
     await gh(
       env,
       token,
       `/repos/${owner}/${name}/releases/tags/${encodeURIComponent(tag.name)}`,
     );
-    return false; // it has one
+    return null; // it has one
   } catch (e) {
     if (!(e instanceof AppError) || e.status !== 404) throw e;
   }
   if ((await publishingCommits(env, token, owner, name, [tag.commit])).length) {
-    return false;
+    return null;
   }
-  await gh(env, token, `/repos/${owner}/${name}/releases`, {
-    method: "POST",
-    body: JSON.stringify({
-      tag_name: tag.name,
-      name: channel === "staging" ? `${tag.name} (beta)` : tag.name,
-      prerelease: channel === "staging",
-      make_latest: "false",
-      generate_release_notes: true,
-    }),
-  });
-  return true;
+  const prerelease = tag.message.split("\n")[0].includes(STAGING_MARK);
+  const latest =
+    !prerelease &&
+    highest(
+      versionTags(tags, prefix).map((t) => `refs/tags/${t.name}`),
+      prefix,
+    ) === tag.name.slice(prefix.length);
+  if (live) {
+    await createRelease(env, token, `${owner}/${name}`, {
+      tag: tag.name,
+      prerelease,
+      latest,
+    });
+  }
+  return tag.name;
 }
 
 /** Every tag of the repository, peeled, starting from an already-read page. */
@@ -493,7 +605,14 @@ export async function allTags(
   return nodes.map(toTagRef);
 }
 
-/** The commits whose own .github/workflows start on tags or releases. */
+/**
+ * The commits whose own .github/workflows start on tags or releases.
+ *
+ * FAIL CLOSED. A commit is cleared only when GitHub confirms the commit
+ * exists and its workflow tree reads cleanly (or it has no workflows
+ * directory). A missing commit, an unexpected response shape, an id that is
+ * not a full SHA, or an unreadable file all count as publishing.
+ */
 export async function publishingCommits(
   env: Env,
   token: string,
@@ -501,35 +620,38 @@ export async function publishingCommits(
   name: string,
   oids: string[],
 ): Promise<string[]> {
-  const unique = [...new Set(oids)].filter((o) => /^[0-9a-f]{40}$/i.test(o));
-  if (unique.length !== new Set(oids).size) {
-    // Not a full commit id: cannot be looked up, so cannot be cleared.
-    return oids;
-  }
+  const unique = [...new Set(oids)];
   if (!unique.length) return [];
+  if (unique.some((o) => !/^[0-9a-f]{40}$/i.test(o))) return unique;
   const fields = unique
     .map(
       (oid, i) =>
-        `w${i}: object(expression: "${oid}:.github/workflows") { ... on Tree { entries { name object { ... on Blob { text isBinary } } } } }`,
+        `c${i}: object(oid: "${oid}") { oid }\n` +
+        `w${i}: object(expression: "${oid}:.github/workflows") { __typename ... on Tree { entries { name object { ... on Blob { text isBinary isTruncated } } } } }`,
     )
     .join("\n");
   const data = await graphql<{
-    repository: Record<string, RepoTree | null>;
+    repository: Record<
+      string,
+      (RepoTree & { __typename?: string; oid?: string }) | null
+    > | null;
   }>(
     env,
     token,
     `query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { ${fields} } }`,
     { owner, name },
   );
-  return unique.filter((_, i) => {
-    const tree = data.repository[`w${i}`];
-    const facts = classifyWorkflows(
-      (tree?.entries ?? []).map((e) => ({
-        name: e.name,
-        text: e.object && !e.object.isBinary ? (e.object.text ?? null) : null,
-      })),
-    );
-    return facts.publishesOnTag;
+  const repo = data.repository;
+  if (!repo || typeof repo !== "object") return unique;
+  return unique.filter((oid, i) => {
+    const commit = repo[`c${i}`];
+    if (!commit || commit.oid?.toLowerCase() !== oid.toLowerCase()) return true;
+    const tree = repo[`w${i}`];
+    if (tree === null) return false; // the commit has no .github/workflows
+    if (!tree || tree.__typename !== "Tree" || !Array.isArray(tree.entries)) {
+      return true;
+    }
+    return classifyWorkflows(treeFiles(tree.entries)).publishesOnTag;
   });
 }
 
@@ -585,7 +707,7 @@ export async function createTagAndRelease(
   repo: string,
   t: PlannedTag,
 ): Promise<void> {
-  const message = t.channel === "staging" ? `${t.tag} (staging)` : `${t.tag}`;
+  const message = tagMessage(t);
   const { body: tagObj } = await gh(env, token, `/repos/${repo}/git/tags`, {
     method: "POST",
     body: JSON.stringify({
@@ -601,15 +723,10 @@ export async function createTagAndRelease(
     method: "POST",
     body: JSON.stringify({ ref: `refs/tags/${t.tag}`, sha }),
   });
-  await gh(env, token, `/repos/${repo}/releases`, {
-    method: "POST",
-    body: JSON.stringify({
-      tag_name: t.tag,
-      name: t.prerelease ? `${t.tag} (beta)` : t.tag,
-      prerelease: t.prerelease,
-      make_latest: t.latest ? "true" : "false",
-      generate_release_notes: true,
-    }),
+  await createRelease(env, token, repo, {
+    tag: t.tag,
+    prerelease: t.prerelease,
+    latest: t.latest,
   });
 }
 
@@ -618,6 +735,7 @@ export function summarise(r: RepoReport): string | null {
   if (r.skipped) return null;
   const parts: string[] = [];
   for (const c of r.channels) {
+    if (c.released) parts.push(`${c.branch}: release for ${c.released}`);
     if (c.note && !c.planned.length) {
       parts.push(`${c.branch}: not tagged (${c.note})`);
       continue;

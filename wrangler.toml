@@ -21,7 +21,8 @@ crons = ["17 1 * * *"]
 # The nightly pass reads ~100 repositories and parses their workflow files.
 [limits]
 cpu_ms = 120000
-# Paid default is 10,000. A live night is ~5 per tag plus 2-3 per repository;
+# Paid default is 10,000. A live night costs 3-4 per repository plus, per
+# tag, a fresh read of the tags (1 per 100 tags) and 3 writes;
 # NIGHTLY_MAX_TAGS keeps it well under this ceiling.
 subrequests = 50000
 
@@ -63,6 +64,16 @@ REVIEW_ENABLED = "true"
 TRIAGE_ENABLED = "true"
 # Spending gate: whose new issues are triaged.
 TRIAGE_TRIGGER_ASSOCIATIONS = "OWNER,MEMBER,COLLABORATOR,CONTRIBUTOR"
+
+# One tagging run per repository at a time (src/lock.ts). Created by the
+# first deploy; no dashboard step.
+[[durable_objects.bindings]]
+name = "TAG_LOCK"
+class_name = "TagLock"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TagLock"]
 
 # Workers AI: no API key, no third-party credential. No Anthropic API.
 [ai]

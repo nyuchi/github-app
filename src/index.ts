@@ -8,15 +8,13 @@
 // GitHub (shamwari-ai/github-app); this Worker only answers GitHub.
 
 import type { Env } from "./env";
-import { orgAllowed, readSecret, splitCsv } from "./env";
-import {
-  installationToken,
-  listInstallations,
-  paginate,
-  TAGGING_PERMISSIONS,
-} from "./app";
-import { type RepoReport, scanRepo, summarise } from "./scan";
+import { readSecret, splitCsv } from "./env";
+import { nightly } from "./nightly";
+import { summarise } from "./scan";
 import { handleWebhook } from "./webhook";
+
+// The per-repository tagging lock; must be exported from the main module.
+export { TagLock } from "./lock-do";
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body, null, 2), {
@@ -40,90 +38,6 @@ async function health(env: Env): Promise<Response> {
       APP_WEBHOOK_SECRET: Boolean(await readSecret(env.APP_WEBHOOK_SECRET)),
     },
   });
-}
-
-interface Repo {
-  name: string;
-  owner: { login: string };
-  archived?: boolean;
-  fork?: boolean;
-}
-
-export interface NightlyResult {
-  orgs: string[];
-  repos: number;
-  reports: RepoReport[];
-  errors: string[];
-}
-
-/** The nightly pass: every allowed org's installation, every repository. */
-/**
- * Start the org list at a different place each day, so a run that spends its
- * tag budget (or hits a limit) does not starve the same trailing orgs.
- */
-export function rotate<T>(items: T[], now = Date.now()): T[] {
-  if (!items.length) return items;
-  const day = Math.floor(now / 86_400_000);
-  const k = day % items.length;
-  return [...items.slice(k), ...items.slice(0, k)];
-}
-
-export async function nightly(
-  env: Env,
-  now = Date.now(),
-): Promise<NightlyResult> {
-  const live = env.TAGGING_MODE === "live";
-  const result: NightlyResult = { orgs: [], repos: 0, reports: [], errors: [] };
-  // A ceiling on tags per night: each costs ~5 subrequests, and a first live
-  // night across the enterprise must not run into the Worker's limit.
-  const budget = {
-    remaining: Math.max(0, Number(env.NIGHTLY_MAX_TAGS) || 300),
-  };
-  const installs = rotate(
-    (await listInstallations(env)).sort((a, b) =>
-      a.account.login.localeCompare(b.account.login),
-    ),
-    now,
-  );
-  for (const inst of installs) {
-    const org = inst.account?.login;
-    if (!orgAllowed(env, org) || inst.suspended_at) continue;
-    result.orgs.push(org);
-    let token: string;
-    let repos: Repo[];
-    try {
-      token = await installationToken(env, inst.id, TAGGING_PERMISSIONS);
-      repos = await paginate<Repo>(
-        env,
-        token,
-        "/installation/repositories?per_page=100",
-        (b) => (b as { repositories?: Repo[] }).repositories ?? [],
-      );
-    } catch (e) {
-      result.errors.push(
-        `${org}: ${e instanceof Error ? e.message : String(e)}`,
-      );
-      continue;
-    }
-    for (const r of repos) {
-      if (r.archived || r.fork) continue;
-      result.repos++;
-      try {
-        result.reports.push(
-          await scanRepo(env, token, r.owner.login, r.name, {
-            trigger: "nightly",
-            live,
-            budget,
-          }),
-        );
-      } catch (e) {
-        result.errors.push(
-          `${r.owner.login}/${r.name}: ${e instanceof Error ? e.message : String(e)}`,
-        );
-      }
-    }
-  }
-  return result;
 }
 
 export default {

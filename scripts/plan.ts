@@ -22,9 +22,16 @@ if (!token) {
 
 const vars: Record<string, string> = {};
 const toml = readFileSync(new URL("../wrangler.toml", import.meta.url), "utf8");
-const block = /\[vars\]([\s\S]*?)(?:\n\[|$)/.exec(toml)?.[1] ?? "";
+// The [vars] table header on a line of its own, up to the next table header.
+// (A bare "[vars]" also appears inside a comment in wrangler.toml.)
+const block =
+  /^\[vars\][ \t]*$([\s\S]*?)(?=^\[|(?![\s\S]))/m.exec(toml)?.[1] ?? "";
 for (const m of block.matchAll(/^([A-Z_]+)\s*=\s*"([^"]*)"/gm))
   vars[m[1]] = m[2];
+if (!vars.BACKFILL_SINCE || !vars.ALLOWED_ORGS) {
+  console.error("Could not read [vars] from wrangler.toml.");
+  process.exit(2);
+}
 const env = { ...vars } as unknown as Env;
 
 const args = process.argv.slice(2);

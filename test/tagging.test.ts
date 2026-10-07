@@ -255,3 +255,15 @@ test("channel decision: publishing repos are never tagged; own tagging defers on
   assert.equal(channelDecision("main", pub, "nightly").tag, false);
   assert.equal(channelDecision("staging", pub, "push").tag, false);
 });
+
+test("fail closed: a workflow that is not a mapping with on: is unreadable, so publishing", () => {
+  for (const text of [
+    "just a string\n",
+    "- a\n- list\n",
+    "name: no trigger\njobs: {}\n",
+  ]) {
+    const f = classifyWorkflows([{ name: "x.yml", text }]);
+    assert.equal(f.publishesOnTag, true, text);
+    assert.deepEqual(f.unreadable, ["x.yml"]);
+  }
+});

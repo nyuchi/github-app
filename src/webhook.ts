@@ -20,7 +20,8 @@ import { reviewPullRequest, reviewPush } from "shamwari-github-mcp/src/review";
 import type { Env } from "./env";
 import { orgAllowed, readSecret, splitCsv } from "./env";
 import { installationToken, TAGGING_PERMISSIONS } from "./app";
-import { scanRepo, summarise } from "./scan";
+import { scanLocked } from "./lock";
+import { summarise } from "./scan";
 import type { Channel } from "./tagging";
 import { decideTriage, triageIssue } from "./triage";
 
@@ -219,10 +220,15 @@ async function runTagging(
       TAGGING_PERMISSIONS,
       [d.name],
     );
-    const report = await scanRepo(env, token, d.owner, d.name, {
-      trigger: "push",
-      only: d.channel,
-      live: env.TAGGING_MODE === "live",
+    const report = await scanLocked(env, {
+      token,
+      owner: d.owner,
+      name: d.name,
+      opts: {
+        trigger: "push",
+        only: d.channel,
+        live: env.TAGGING_MODE === "live",
+      },
     });
     const line = summarise(report);
     console.log(

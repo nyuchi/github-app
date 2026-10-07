@@ -57,8 +57,23 @@ This Worker only decides **which commits are releases**:
   Creating the ref is the final atomic guard: GitHub answers 422 when it
   already exists.
 
-- The newest tag on each branch is given its GitHub release if a run made the
-  tag but failed on the release.
+- If a run made a tag but failed to create its release, the next run creates
+  that release. This applies only to tags this app made, which carry
+  `Tagged-by: nyuchi-github-app`. The channel and "latest" come from the tag
+  itself. A dry run reports these repairs.
+- One tagging run per repository at a time. Every run, push or nightly, goes
+  through a Durable Object (`TagLock`, named after the repository) and runs
+  under its lock. Two runs can therefore never put two different versions on
+  one commit. A live run refuses to start without the lock.
+- **Fail closed** on anything unverified:
+  - an unset or unparseable `BACKFILL_SINCE`;
+  - a mistyped limit;
+  - a commit GitHub cannot find;
+  - an unexpected response shape;
+  - a binary, truncated or non-mapping workflow file.
+
+  Each of these skips the repository and logs why. It never tags.
+
 - A staging-tagged commit that reaches the default branch by fast-forward
   gets no minor tag, because the walk stops at its tag. Rulesets allow only
   squash and rebase merges through pull requests, and both create new

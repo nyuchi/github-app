@@ -19,6 +19,9 @@ export interface Env {
   /** The webhook secret set on the App. Unset: /webhook answers 503. */
   APP_WEBHOOK_SECRET?: StoreSecret;
 
+  // ---- Per-repository tagging lock (Durable Object, see lock.ts) -----------
+  TAG_LOCK?: import("./lock").TagLockNamespace;
+
   // ---- Identity -------------------------------------------------------------
   GITHUB_APP_ID?: string;
   GITHUB_API?: string;

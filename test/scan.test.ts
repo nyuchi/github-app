@@ -38,6 +38,7 @@ const PUBLISH_ON_TAG = {
 interface FakeTag {
   name: string;
   commit: string;
+  message?: string;
 }
 
 /**
@@ -52,9 +53,13 @@ function fakeGitHub(opts: {
   /** Called before each GraphQL answer; lets a test change state mid-run. */
   onGraphql?: (query: string, tags: FakeTag[]) => void;
   refStatus?: number;
+  /** Commit ids GitHub does not find (fail-closed tests). */
+  missingCommits?: string[];
+  /** Answer the per-commit workflow query with an unexpected shape. */
+  badWorkflowShape?: boolean;
 }) {
   const tags: FakeTag[] = [...(opts.tags ?? [])];
-  const tagObjects = new Map<string, string>();
+  const tagObjects = new Map<string, { commit: string; message: string }>();
   const byHash = new Map<string, string>();
   for (const [n] of Object.entries(opts.workflowsAt ?? {})) byHash.set(H(n), n);
   const tagNodes = () => ({
@@ -64,6 +69,7 @@ function fakeGitHub(opts: {
       target: {
         __typename: "Tag",
         oid: `obj-${t.name}`,
+        ...(t.message ? { message: t.message } : {}),
         target: { oid: t.commit },
       },
     })),
@@ -114,16 +120,32 @@ function fakeGitHub(opts: {
         // publishingCommits: aliases w0..wN over "<oid>:.github/workflows"
         const repository: Record<string, unknown> = {};
         for (const m of query.matchAll(
+          /(c\d+): object\(oid: "([0-9a-f]{40})"\)/g,
+        )) {
+          repository[m[1]] = (opts.missingCommits ?? []).includes(m[2])
+            ? null
+            : { oid: m[2] };
+        }
+        for (const m of query.matchAll(
           /(w\d+): object\(expression: "([0-9a-f]{40}):/g,
         )) {
           const name = byHash.get(m[2]);
-          repository[m[1]] = name ? { entries: opts.workflowsAt![name] } : null;
+          repository[m[1]] = name
+            ? { __typename: "Tree", entries: opts.workflowsAt![name] }
+            : null;
         }
-        return { body: { data: { repository } } };
+        return {
+          body: {
+            data: opts.badWorkflowShape ? { repository: null } : { repository },
+          },
+        };
       }
       if (method === "POST" && url.endsWith("/git/tags")) {
-        const b = body as { tag: string; object: string };
-        tagObjects.set(`obj-${b.tag}`, b.object);
+        const b = body as { tag: string; object: string; message: string };
+        tagObjects.set(`obj-${b.tag}`, {
+          commit: b.object,
+          message: b.message,
+        });
         return { status: 201, body: { sha: `obj-${b.tag}` } };
       }
       if (method === "POST" && url.endsWith("/git/refs")) {
@@ -137,7 +159,8 @@ function fakeGitHub(opts: {
         if (tags.some((t) => t.name === name)) {
           return { status: 422, body: { message: "Reference already exists" } };
         }
-        tags.push({ name, commit: tagObjects.get(b.sha)! });
+        const obj = tagObjects.get(b.sha)!;
+        tags.push({ name, commit: obj.commit, message: obj.message });
         return { status: 201, body: {} };
       }
       return { status: 201, body: {} };
@@ -239,7 +262,7 @@ test("live mode re-verifies, then creates the annotated tag, the ref and the rel
     assert.match(w[0].url, /\/repos\/nyuchi\/lic\/git\/tags$/);
     assert.deepEqual(w[0].body, {
       tag: "v0.1.0",
-      message: "v0.1.0",
+      message: "v0.1.0\n\nTagged-by: nyuchi-github-app\n",
       object: H("m1"),
       type: "commit",
     });
@@ -554,9 +577,12 @@ test("history beyond the window with no tag in sight tags nothing (no stranded m
   }
 });
 
+const APP_MSG = (tag: string, staging = false) =>
+  `${tag}${staging ? " (staging)" : ""}\n\nTagged-by: nyuchi-github-app\n`;
+
 test("a tag whose release creation failed gets its release on the next run", async () => {
   const gh = fakeGitHub({
-    tags: [{ name: "v0.3.0", commit: H("m3") }],
+    tags: [{ name: "v0.3.0", commit: H("m3"), message: APP_MSG("v0.3.0") }],
     repo: { staging: null, workflows: { entries: [] } },
   });
   const m = mockFetch((method, url, body) => {
@@ -580,7 +606,7 @@ test("a tag whose release creation failed gets its release on the next run", asy
         tag_name: "v0.3.0",
         name: "v0.3.0",
         prerelease: false,
-        make_latest: "false",
+        make_latest: "true",
         generate_release_notes: true,
       },
     );
@@ -606,6 +632,215 @@ test("the nightly tag budget stops writes and reports the rest as pending", asyn
     assert.equal(r.channels[0].pending, 2);
     assert.match(r.channels[0].note ?? "", /budget/);
     assert.equal(budget.remaining, 0);
+  } finally {
+    m.restore();
+  }
+});
+
+// ---- Finding 3 (fail-open validation): never tag on an unverified result ---
+
+test("fail closed: a commit GitHub cannot find is never cleared", async () => {
+  const gh = fakeGitHub({
+    tags: [{ name: "v0.0.9", commit: H("s4") }],
+    repo: { staging: null, workflows: { entries: [] } },
+    missingCommits: [H("m1")],
+  });
+  const m = mockFetch((method, url, body) => gh.route(method, url, body));
+  try {
+    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", {
+      trigger: "nightly",
+      live: true,
+    });
+    assert.equal(writes(m.calls).length, 0);
+    assert.match(r.channels[0].note ?? "", /starts on tags or releases/);
+  } finally {
+    m.restore();
+  }
+});
+
+test("fail closed: an unexpected response shape for the workflow check tags nothing", async () => {
+  const gh = fakeGitHub({
+    tags: [{ name: "v0.0.9", commit: H("s4") }],
+    repo: { staging: null, workflows: { entries: [] } },
+    badWorkflowShape: true,
+  });
+  const m = mockFetch((method, url, body) => gh.route(method, url, body));
+  try {
+    await scanRepo(testEnv(), "tok", "nyuchi", "x", {
+      trigger: "nightly",
+      live: true,
+    });
+    assert.equal(writes(m.calls).length, 0);
+  } finally {
+    m.restore();
+  }
+});
+
+test("fail closed: truncated, binary or non-blob workflow files count as publishing", async () => {
+  for (const object of [
+    {
+      isBinary: false,
+      isTruncated: true,
+      text: "on:\n  push:\n    branches: [main]\n",
+    },
+    { isBinary: true, text: null },
+    undefined,
+  ]) {
+    const gh = fakeGitHub({
+      tags: [{ name: "v0.0.9", commit: H("s4") }],
+      repo: { staging: null, workflows: { entries: [] } },
+      workflowsAt: { m1: [{ name: "ci.yml", object }] },
+    });
+    const m = mockFetch((method, url, body) => gh.route(method, url, body));
+    try {
+      await scanRepo(testEnv(), "tok", "nyuchi", "x", {
+        trigger: "nightly",
+        live: true,
+      });
+      assert.equal(writes(m.calls).length, 0, JSON.stringify(object));
+    } finally {
+      m.restore();
+    }
+  }
+});
+
+test("fail closed: an unset or bad BACKFILL_SINCE never widens to all history", async () => {
+  for (const since of [undefined, "", "yesterday-ish"]) {
+    const gh = fakeGitHub({ tags: [{ name: "v0.0.9", commit: H("s4") }] });
+    const m = mockFetch((method, url, body) => gh.route(method, url, body));
+    try {
+      await assert.rejects(
+        scanRepo(testEnv({ BACKFILL_SINCE: since }), "tok", "nyuchi", "x", {
+          trigger: "nightly",
+          live: true,
+        }),
+        /BACKFILL_SINCE/,
+      );
+      assert.equal(m.calls.length, 0, "nothing read or written");
+    } finally {
+      m.restore();
+    }
+  }
+});
+
+test("fail closed: a mistyped limit stops tagging instead of becoming another limit", async () => {
+  for (const [k, v] of [
+    ["BACKFILL_MAX_PER_REPO", "ten"],
+    ["SCAN_HISTORY", "500"],
+    ["BACKFILL_MAX_PER_REPO", "-1"],
+  ] as const) {
+    const m = mockFetch(() => ({ body: {} }));
+    try {
+      await assert.rejects(
+        scanRepo(testEnv({ [k]: v }), "tok", "nyuchi", "x", {
+          trigger: "nightly",
+          live: true,
+        }),
+        new RegExp(k),
+      );
+      assert.equal(m.calls.length, 0);
+    } finally {
+      m.restore();
+    }
+  }
+  // "0" means zero, not the default.
+  const gh = fakeGitHub({
+    tags: [{ name: "v0.0.9", commit: H("s4") }],
+    repo: { staging: null },
+  });
+  const m = mockFetch((method, url, body) => gh.route(method, url, body));
+  try {
+    const r = await scanRepo(
+      testEnv({ BACKFILL_MAX_PER_REPO: "0" }),
+      "tok",
+      "nyuchi",
+      "x",
+      {
+        trigger: "nightly",
+        live: true,
+      },
+    );
+    assert.equal(writes(m.calls).length, 0);
+    assert.equal(r.channels[0].pending, 3);
+  } finally {
+    m.restore();
+  }
+});
+
+test("release repair: hand-made or workflow-made tags are never touched", async () => {
+  const gh = fakeGitHub({
+    tags: [{ name: "v0.3.0", commit: H("m3"), message: "v0.3.0" }],
+    repo: { staging: null, workflows: { entries: [] } },
+  });
+  const m = mockFetch((method, url, body) => {
+    if (method === "GET" && url.includes("/releases/tags/"))
+      return { status: 404, body: {} };
+    return gh.route(method, url, body);
+  });
+  try {
+    await scanRepo(testEnv(), "tok", "nyuchi", "x", {
+      trigger: "nightly",
+      live: true,
+    });
+    assert.equal(m.calls.filter((c) => c.url.includes("/releases")).length, 0);
+  } finally {
+    m.restore();
+  }
+});
+
+test("release repair: channel comes from the tag, not the branch being walked", async () => {
+  // main's walk stops at a STAGING tag (merge-commit flow): its release is a
+  // pre-release named (beta), never a full release, and never latest.
+  const gh = fakeGitHub({
+    tags: [
+      { name: "v1.2.5", commit: H("m3"), message: APP_MSG("v1.2.5", true) },
+    ],
+    repo: { staging: null, workflows: { entries: [] } },
+  });
+  const m = mockFetch((method, url, body) => {
+    if (method === "GET" && url.includes("/releases/tags/"))
+      return { status: 404, body: {} };
+    return gh.route(method, url, body);
+  });
+  try {
+    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", {
+      trigger: "push",
+      only: "main",
+      live: true,
+    });
+    const rel = m.calls.find(
+      (c) => c.method === "POST" && c.url.endsWith("/releases"),
+    )!;
+    assert.deepEqual(rel.body, {
+      tag_name: "v1.2.5",
+      name: "v1.2.5 (beta)",
+      prerelease: true,
+      make_latest: "false",
+      generate_release_notes: true,
+    });
+    assert.equal(r.channels[0].released, "v1.2.5");
+  } finally {
+    m.restore();
+  }
+});
+
+test("release repair is reported, not made, in a dry run", async () => {
+  const gh = fakeGitHub({
+    tags: [{ name: "v0.3.0", commit: H("m3"), message: APP_MSG("v0.3.0") }],
+    repo: { staging: null, workflows: { entries: [] } },
+  });
+  const m = mockFetch((method, url, body) => {
+    if (method === "GET" && url.includes("/releases/tags/"))
+      return { status: 404, body: {} };
+    return gh.route(method, url, body);
+  });
+  try {
+    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", {
+      trigger: "nightly",
+      live: false,
+    });
+    assert.equal(writes(m.calls).length, 0);
+    assert.match(summarise(r) ?? "", /release for v0\.3\.0/);
   } finally {
     m.restore();
   }

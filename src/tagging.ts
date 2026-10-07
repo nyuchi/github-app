@@ -29,6 +29,8 @@ export interface TagRef {
   name: string;
   /** The commit the tag points at (peeled through an annotated tag object). */
   commit: string;
+  /** An annotated tag's message (absent for lightweight tags). */
+  message?: string;
 }
 
 export interface PlannedTag {
@@ -240,7 +242,19 @@ export function classifyWorkflows(
       facts.publishesOnTag = true;
       continue;
     }
-    const on = (doc as Record<string, unknown> | null)?.on;
+    // Fail closed on an unexpected shape: a workflow file that is not a
+    // mapping with an `on:` key cannot be cleared, so it counts as publishing.
+    if (
+      !doc ||
+      typeof doc !== "object" ||
+      Array.isArray(doc) ||
+      !("on" in doc)
+    ) {
+      facts.unreadable.push(f.name);
+      facts.publishesOnTag = true;
+      continue;
+    }
+    const on = (doc as Record<string, unknown>).on;
     if (startsOnTagOrRelease(on)) facts.publishesOnTag = true;
   }
   return facts;
