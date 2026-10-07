@@ -158,22 +158,6 @@ export async function listInstallations(env: Env): Promise<Installation[]> {
   );
 }
 
-/** The installation id that covers one owner (org). */
-export async function installationForOrg(
-  env: Env,
-  org: string,
-): Promise<number> {
-  const jwt = await appJwt(env);
-  const { body } = await gh(
-    env,
-    jwt,
-    `/orgs/${encodeURIComponent(org)}/installation`,
-  );
-  const id = (body as { id?: number }).id;
-  if (!id) throw new AppError(`no installation on ${org}`, 404);
-  return id;
-}
-
 /**
  * Parse "name:level,name:level" into the permissions object GitHub takes.
  * A token may request a SUBSET of what the App holds, never more.

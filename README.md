@@ -39,12 +39,15 @@ This Worker only decides **which commits are releases**:
   carries a `v<semver>` tag. Every commit after that is unreleased.
 - Unreleased commits are grouped by the pull request that merged them into
   **this** branch. A rebase merge is one release, tagged on its newest commit.
-  A commit with no pull request is a release on its own. A commit that came
-  through a pull request into another branch (a back-merge of main into
-  staging, say) is not a release of this branch and is never tagged on it.
+  A commit with no pull request is a release on its own. A commit whose
+  only pull requests merged into another branch (it reached this one by a
+  fast-forward) is not a release of this branch and is never tagged on it.
+  A back-merge made through its own pull request into this branch is a
+  release like any other. At night, commits younger than an hour without an
+  indexed pull request wait for the next night.
 - Releases are tagged oldest first, each at the next version above the highest
   existing tag. Only the newest default-branch release is marked "latest".
-- At most `BACKFILL_MAX_PER_REPO` tags per repository per run, and
+- At most `BACKFILL_MAX_PER_REPO` tags per channel (branch) per run, and
   `NIGHTLY_MAX_TAGS` across one night. The rest are reported as pending. The
   org order rotates daily.
 - If a branch has more untagged history than the scan reads (10 pages) and no

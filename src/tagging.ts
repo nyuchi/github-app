@@ -29,11 +29,15 @@ export interface Commit {
   /** Pull request that merged this commit into THIS branch, if GitHub knows one. */
   pr: number | null;
   /**
-   * The commit arrived through a pull request merged into ANOTHER branch
-   * (a back-merge of main into staging, say). It is not a release of this
-   * branch: it is never tagged here and never opens a release group.
+   * The commit's only merged pull requests went into ANOTHER branch (it
+   * reached this one by a fast-forward of that branch's commit). It is not
+   * a release of this branch: never tagged here, never a release group. A
+   * back-merge made through its own pull request into this branch IS a
+   * change to this branch and is released like any other.
    */
   foreign?: boolean;
+  /** When the commit was made (ISO), for the nightly grace window. */
+  committedDate?: string;
 }
 
 export interface TagRef {

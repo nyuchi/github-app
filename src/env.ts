@@ -46,7 +46,7 @@ export interface Env {
   TAG_PREFIX?: string;
   /** The nightly pass only looks at merges after this ISO date. */
   BACKFILL_SINCE?: string;
-  /** Most tags the app creates in one repository per run (default 10). */
+  /** Most tags the app creates per channel (branch) of a repository per run (default 10). */
   BACKFILL_MAX_PER_REPO?: string;
   /** Commits per history page the scan reads (default 50, max 100). */
   SCAN_HISTORY?: string;

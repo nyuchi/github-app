@@ -41,6 +41,7 @@ const HISTORY_NODES = `
   pageInfo { hasNextPage endCursor }
   nodes {
     oid
+    committedDate
     associatedPullRequests(first: 5) { nodes { number merged baseRefName } }
   }`;
 
@@ -119,6 +120,7 @@ const MAX_TAG_PAGES = 51;
 
 interface HistoryNode {
   oid: string;
+  committedDate?: string;
   associatedPullRequests?: {
     nodes: { number: number; merged: boolean; baseRefName?: string }[];
   };
@@ -300,12 +302,14 @@ export function toCommits(
     const merged = (n.associatedPullRequests?.nodes ?? []).filter(
       (p) => p.merged,
     );
+    const at = n.committedDate ? { committedDate: n.committedDate } : {};
     const here = merged.find((p) => p.baseRefName === branch);
-    if (here) return { oid: n.oid, pr: here.number };
+    if (here) return { oid: n.oid, pr: here.number, ...at };
     // Merged only into other branches: it reached this branch some other
-    // way (a back-merge), so it is not a release of this branch.
-    if (merged.length) return { oid: n.oid, pr: null, foreign: true };
-    return { oid: n.oid, pr: null };
+    // way (a fast-forward of another branch's commit), so it is not a
+    // release of this branch.
+    if (merged.length) return { oid: n.oid, pr: null, foreign: true, ...at };
+    return { oid: n.oid, pr: null, ...at };
   });
 }
 
@@ -526,6 +530,8 @@ async function scanInner(
         prefix,
         opts.ledger,
         protectedBranches,
+        tags,
+        report.errors,
       );
       if (repaired.length) report.repaired = repaired;
     } catch (e) {
@@ -591,10 +597,19 @@ async function scanChannel(
 
   // A merge whose pull request GitHub has not indexed yet looks like a
   // direct push, and would split one rebase merge into several versions.
-  // On push, hold; the nightly pass (hours later) tags it.
+  // On push, hold; the nightly pass tags it. At night, hold too while any
+  // such commit is younger than an hour (a merge just before the cron).
+  const young = (iso?: string) => {
+    const t = iso ? Date.parse(iso) : NaN;
+    return !Number.isFinite(t) || Date.now() - t < 3_600_000;
+  };
   if (
-    opts.trigger === "push" &&
-    history.untagged.some((x) => x.pr === null && !x.foreign)
+    history.untagged.some(
+      (x) =>
+        x.pr === null &&
+        !x.foreign &&
+        (opts.trigger === "push" || young(x.committedDate)),
+    )
   ) {
     entry.note =
       "a new commit's pull request is not indexed yet; the nightly pass tags it";
@@ -612,18 +627,17 @@ async function scanChannel(
   // The default branch's workflows were checked above. A tag push runs the
   // workflows AT THE TAGGED COMMIT, so every commit about to be tagged is
   // checked too.
-  const atCommits = await commitFacts(
-    env,
-    token,
-    owner,
-    name,
-    plan.tags.map((t) => t.commit),
-  );
-  const publishing = [...atCommits]
-    .filter(([, f]) => f.publishesOnTag)
-    .map(([oid]) => oid);
-  // On push, a repo that tags this channel itself at THESE commits (a
-  // staging-only reusable-staging-release, say) is tagging them right now.
+  const head = history.commits[0]?.oid;
+  const atCommits = await commitFacts(env, token, owner, name, [
+    ...plan.tags.map((t) => t.commit),
+    ...(head ? [head] : []),
+  ]);
+  const publishing = plan.tags
+    .map((t) => t.commit)
+    .filter((oid) => atCommits.get(oid)?.publishesOnTag !== false);
+  // On push, a repo that tags this channel itself at these commits or at
+  // the pushed head (a staging-only reusable-staging-release, say) is
+  // tagging right now.
   const ownTagger = [...atCommits.values()].some((f) =>
     channel === "staging" ? f.tagsStaging : f.tagsMain,
   );
@@ -977,6 +991,8 @@ export async function repairReleases(
   prefix: string,
   ledger: ReleaseLedger,
   branches: string[],
+  tags: TagRef[],
+  errors: string[],
 ): Promise<string[]> {
   const pending = await ledger.list();
   if (!pending.length) return [];
@@ -994,28 +1010,38 @@ export async function repairReleases(
     name,
     pending.map((e) => e.commit),
   );
-  const live = versionTags(await allTags(env, token, owner, name), prefix);
+  const live = versionTags(tags, prefix);
   const repaired: string[] = [];
   for (const e of pending) {
+    try {
+      if (await repairOne(e)) repaired.push(e.tag);
+    } catch (err) {
+      // One entry's failure never blocks the others.
+      errors.push(`release for ${e.tag}: ${msg(err)}`);
+    }
+  }
+  return repaired;
+
+  async function repairOne(e: LedgerEntry): Promise<boolean> {
     // The ref through REST, which is consistent with this app's own REST
     // writes (a GraphQL read may lag behind them).
     const ref = await tagRef(env, token, owner, name, e.tag);
     if (ref === "absent") {
       await ledger.remove(e.tag); // never created, or deleted: nothing to do
-      continue;
+      return false;
     }
-    if (ref === null) continue; // unknown: try again later
+    if (ref === null) return false; // unknown: try again later
     if (ref.type !== "tag" || ref.sha !== e.object) {
       // Re-made by someone else (a different object), even under our name.
       await ledger.remove(e.tag);
-      continue;
+      return false;
     }
     // A tag object's sha is the hash of its content, so the recorded object
     // still names the recorded commit.
-    if (releases === null) continue;
+    if (releases === null) return false;
     if (releases.has(e.tag)) {
       await ledger.remove(e.tag);
-      continue;
+      return false;
     }
     let reachable = false;
     for (const b of protectedBranches) {
@@ -1024,8 +1050,8 @@ export async function repairReleases(
         break;
       }
     }
-    if (!reachable) continue;
-    if (facts.get(e.commit)?.publishesOnTag !== false) continue;
+    if (!reachable) return false;
+    if (facts.get(e.commit)?.publishesOnTag !== false) return false;
     // Latest only if, as recorded, it was the newest default-branch release
     // AND no higher non-beta version tag has appeared since.
     const version = e.tag.slice(prefix.length);
@@ -1040,9 +1066,8 @@ export async function repairReleases(
       pr: e.pr,
     });
     await ledger.remove(e.tag);
-    repaired.push(e.tag);
+    return true;
   }
-  return repaired;
 }
 
 /**
