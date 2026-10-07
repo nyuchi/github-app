@@ -846,7 +846,12 @@ export async function arrivedRecently(
     // indexing, and the record may simply not reach back that far (an
     // import, a template): then waiting would never end.
     const t = headCommittedAt ? Date.parse(headCommittedAt) : NaN;
-    return !(Number.isFinite(t) && Date.now() - t > 48 * 3_600_000);
+    // A date in the future (a bad committer clock) proves nothing either
+    // way; it is treated as old, so the wait cannot last until that date.
+    return !(
+      Number.isFinite(t) &&
+      (Date.now() - t > 48 * 3_600_000 || t > Date.now() + 86_400_000)
+    );
   }
   let seenOld = false;
   const now = Date.now();
@@ -1051,34 +1056,27 @@ export async function createTagRef(
 
 /**
  * Draft releases, read once per repair pass: drafts are not answered by
- * GET /releases/tags/{tag}. The list is newest first, and a draft for one of
- * our tags cannot be older than the tag, so the read stops at the first
- * release created more than a day before the oldest pending entry. null when
- * that point was not reached within 10 pages.
+ * GET /releases/tags/{tag}, and a draft may be older than the tag (made
+ * ahead by a person or Release Drafter), so the whole list is read, up to
+ * 10 pages. null when it is longer: then no draft can be ruled out.
  */
 async function draftTags(
   env: Env,
   token: string,
   owner: string,
   name: string,
-  since: number,
 ): Promise<Set<string> | null> {
   const drafts = new Set<string>();
   let url: string | null = `/repos/${owner}/${name}/releases?per_page=100`;
   for (let i = 0; url && i < 10; i++) {
     const res: GhResponse = await gh(env, token, url);
-    if (!Array.isArray(res.body))
+    if (!Array.isArray(res.body)) {
       throw new AppError("releases could not be read", 502);
-    for (const r of res.body as {
-      tag_name?: unknown;
-      draft?: unknown;
-      created_at?: unknown;
-    }[]) {
-      if (r.draft === true && typeof r.tag_name === "string")
+    }
+    for (const r of res.body as { tag_name?: unknown; draft?: unknown }[]) {
+      if (r.draft === true && typeof r.tag_name === "string") {
         drafts.add(r.tag_name);
-      const at =
-        typeof r.created_at === "string" ? Date.parse(r.created_at) : NaN;
-      if (Number.isFinite(at) && at < since - 86_400_000) return drafts;
+      }
     }
     const m = /<([^>]+)>;\s*rel="next"/.exec(res.headers.get("link") || "");
     url = m ? m[1] : null;
@@ -1116,29 +1114,41 @@ export async function repairReleases(
 ): Promise<string[]> {
   const pending = await ledger.list();
   if (!pending.length) return [];
-  // Per-repository reads, once.
-  const protectedBranches: string[] = [];
-  for (const b of branches) {
-    if (await branchIsProtected(env, token, owner, name, b))
-      protectedBranches.push(b);
-  }
-  const facts = await commitFacts(
-    env,
-    token,
-    owner,
-    name,
-    pending.map((e) => e.commit),
-  );
-  // Fresh, joined with this run's own writes: "newer" must see tags made by
-  // anyone during the run, and our own even if the index lags.
-  const fresh = await allTags(env, token, owner, name);
-  for (const t of tags)
-    if (!fresh.some((x) => x.name === t.name)) fresh.push(t);
-  const live = versionTags(fresh, prefix);
-  const oldest = Math.min(...pending.map((e) => e.at ?? 0));
-  let drafts: Set<string> | null | undefined; // read lazily, once
-
   const repaired: string[] = [];
+
+  // Per-repository reads, once. If they fail, every entry has a transient
+  // run counted, so a read that keeps failing still ends (and is reported).
+  const protectedBranches: string[] = [];
+  let facts: Map<string, WorkflowFacts>;
+  let live: TagRef[];
+  try {
+    for (const b of branches) {
+      if (await branchIsProtected(env, token, owner, name, b)) {
+        protectedBranches.push(b);
+      }
+    }
+    facts = await commitFacts(
+      env,
+      token,
+      owner,
+      name,
+      pending.map((e) => e.commit),
+    );
+    // Fresh, joined with this run's own writes: "newer" must see tags made
+    // by anyone during the run, and our own even if the index lags.
+    const fresh = await allTags(env, token, owner, name);
+    for (const t of tags)
+      if (!fresh.some((x) => x.name === t.name)) fresh.push(t);
+    live = versionTags(fresh, prefix);
+  } catch (err) {
+    for (const e of pending)
+      await count(e, { outcome: "transient", why: msg(err) });
+    return repaired;
+  }
+  // Read lazily, once; a failed read is remembered, not repeated per entry.
+  let drafts: Set<string> | null | undefined;
+  let draftsError: unknown;
+
   for (const e of pending) {
     let r: Outcome;
     try {
@@ -1153,22 +1163,27 @@ export async function repairReleases(
         !(err instanceof AppError);
       r = { outcome: transient ? "transient" : "stuck", why };
     }
-    if (r.outcome === "done") continue;
+    if (r.outcome !== "done") await count(e, r);
+  }
+  return repaired;
+
+  /** Count a failed run for one entry; give up (and report) at the bound. */
+  async function count(e: LedgerEntry, r: Outcome): Promise<void> {
     try {
       const transient = r.outcome === "transient";
-      const count = transient ? (e.transient ?? 0) + 1 : (e.attempts ?? 0) + 1;
+      const n = transient ? (e.transient ?? 0) + 1 : (e.attempts ?? 0) + 1;
       const limit = transient ? MAX_TRANSIENT_RUNS : MAX_REPAIR_ATTEMPTS;
-      if (count >= limit) {
+      if (n >= limit) {
         await ledger.remove(e.tag);
         errors.push(
-          `release for ${e.tag}: giving up after ${count} ${transient ? "failed" : "stuck"} runs: ${r.why}`,
+          `release for ${e.tag}: giving up after ${n} ${transient ? "failed" : "stuck"} runs: ${r.why}`,
         );
       } else {
         await ledger.add(
-          transient ? { ...e, transient: count } : { ...e, attempts: count },
+          transient ? { ...e, transient: n } : { ...e, attempts: n },
         );
         errors.push(
-          `release for ${e.tag} (${transient ? "will retry" : `stuck, run ${count}`}): ${r.why}`,
+          `release for ${e.tag} (${transient ? "will retry" : `stuck, run ${n}`}): ${r.why}`,
         );
       }
     } catch (le) {
@@ -1177,7 +1192,6 @@ export async function repairReleases(
       );
     }
   }
-  return repaired;
 
   async function repairOne(e: LedgerEntry): Promise<Outcome> {
     // The ref through REST, which is consistent with this app's own REST
@@ -1191,11 +1205,12 @@ export async function repairReleases(
       await ledger.remove(e.tag);
       return { outcome: "done", why: "" };
     }
-    if (ref === null)
+    if (ref === null) {
       return {
         outcome: "stuck",
         why: "the tag ref answered in an unexpected shape",
       };
+    }
     try {
       await gh(
         env,
@@ -1207,12 +1222,19 @@ export async function repairReleases(
     } catch (err) {
       if (!(err instanceof AppError) || err.status !== 404) throw err;
     }
-    if (drafts === undefined)
-      drafts = await draftTags(env, token, owner, name, oldest);
+    if (draftsError) throw draftsError;
+    if (drafts === undefined) {
+      try {
+        drafts = await draftTags(env, token, owner, name);
+      } catch (err) {
+        draftsError = err;
+        throw err;
+      }
+    }
     if (drafts === null) {
       return {
         outcome: "stuck",
-        why: "the release list is too long to rule out a draft",
+        why: "more than 1,000 releases; a draft cannot be ruled out",
       };
     }
     if (drafts.has(e.tag)) {
@@ -1226,11 +1248,12 @@ export async function repairReleases(
         break;
       }
     }
-    if (!reachable)
+    if (!reachable) {
       return {
         outcome: "stuck",
         why: "the commit is not on a protected release branch",
       };
+    }
     if (facts.get(e.commit)?.publishesOnTag !== false) {
       return {
         outcome: "stuck",

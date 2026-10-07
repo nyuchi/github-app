@@ -1886,3 +1886,75 @@ test("a waiting channel shows how many releases wait", () => {
   });
   assert.match(line ?? "", /\+2 pending/);
 });
+
+test("repair: a draft older than the tag (Release Drafter) is still found; no duplicate", async () => {
+  const ledger = memLedger([entry("v0.2.0", H("m2"), { at: Date.now() })]);
+  const fake = fakeGitHub({
+    tags: [{ name: "v0.2.0", commit: H("m2") }],
+    repo: { staging: null, workflows: tree() },
+  });
+  const m = mockFetch((method, url, body) => {
+    if (method === "GET" && url.includes("/releases?")) {
+      return {
+        body: [
+          {
+            tag_name: "v0.3.0-beta",
+            draft: false,
+            created_at: new Date(Date.now() - 2 * 86_400_000).toISOString(),
+          },
+          {
+            tag_name: "v0.2.0",
+            draft: true,
+            created_at: new Date(Date.now() - 5 * 86_400_000).toISOString(),
+          },
+        ],
+      };
+    }
+    return fake.route(method, url, body);
+  });
+  try {
+    await scanRepo(testEnv(), "tok", "nyuchi", "x", live({ ledger }));
+    assert.equal(
+      m.calls.filter(
+        (c) =>
+          c.method === "POST" &&
+          c.url.endsWith("/releases") &&
+          (c.body as { tag_name?: string }).tag_name === "v0.2.0",
+      ).length,
+      0,
+    );
+    assert.deepEqual(await ledger.list(), []);
+  } finally {
+    m.restore();
+  }
+});
+
+test("repair: a per-repository read that fails counts a transient run for every entry", async () => {
+  const ledger = memLedger([
+    entry("v0.2.0", H("m2")),
+    entry("v0.3.0", H("m3")),
+  ]);
+  const fake = fakeGitHub({
+    tags: [{ name: "v0.3.0", commit: H("m3") }],
+    repo: { staging: null, workflows: tree() },
+  });
+  let repairing = false;
+  const m = mockFetch((method, url, body) => {
+    const q = (body as { query?: string } | undefined)?.query ?? "";
+    // Fail the batched facts query that repair runs before its loop.
+    if (repairing && /c1: object/.test(q))
+      return { status: 502, body: { message: "Bad Gateway" } };
+    if (method === "GET" && url.includes("/rules/branches/")) repairing = true;
+    return fake.route(method, url, body);
+  });
+  try {
+    await scanRepo(testEnv(), "tok", "nyuchi", "x", live({ ledger }));
+    const after = await ledger.list();
+    assert.deepEqual(
+      after.map((e) => e.transient),
+      [1, 1],
+    );
+  } finally {
+    m.restore();
+  }
+});

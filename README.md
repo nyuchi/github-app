@@ -47,7 +47,8 @@ This Worker only decides **which commits are releases**:
   have just arrived, the whole channel waits for a later run, so one rebase
   merge is never split. On push it always waits. At night it waits when
   GitHub's activity record for the ref shows the commit arrived within the
-  last hour, or cannot say.
+  last hour, or cannot say, unless the branch head was committed more than
+  two days ago (then the record simply does not reach back that far).
 - Releases are tagged oldest first, each at the next version above the highest
   existing tag. Only the newest default-branch release is marked "latest".
 - At most `BACKFILL_MAX_PER_REPO` tags per channel (branch) per run, and
