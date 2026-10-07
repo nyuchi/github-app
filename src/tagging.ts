@@ -15,7 +15,12 @@
 // and gets one tag on its newest commit.
 
 import { parse as parseYaml } from "yaml";
-import { highest, nextVersion, PolicyError } from "./policy/next-version.mjs";
+import {
+  highest,
+  isStrictVersion,
+  nextVersion,
+  PolicyError,
+} from "./policy/next-version.mjs";
 
 export type Channel = "staging" | "main";
 
@@ -62,15 +67,19 @@ export interface Plan {
   stopped?: string;
 }
 
-const VSEMVER = (prefix: string) =>
-  new RegExp(
-    `^${prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$`,
-  );
-
-/** The repo's version tags (prefix + semver), the rest ignored. */
+/**
+ * The repo's version tags: the prefix plus a STRICT version, as the org
+ * policy's one parser (isStrictVersion, vendored from nyuchi/.github) reads
+ * it. Pre-releases, build metadata, leading zeros and anything else are not
+ * version tags. Using the policy's own parser means this app, the policy
+ * and the required check cannot disagree about what a version is; the
+ * differential test runs the shared fixtures through all of them.
+ */
 export function versionTags(tags: TagRef[], prefix = "v"): TagRef[] {
-  const re = VSEMVER(prefix);
-  return tags.filter((t) => re.test(t.name));
+  return tags.filter(
+    (t) =>
+      t.name.startsWith(prefix) && isStrictVersion(t.name.slice(prefix.length)),
+  );
 }
 
 /**
