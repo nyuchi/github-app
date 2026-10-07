@@ -75,6 +75,8 @@ interface FakeOpts {
   unprotected?: boolean;
   /** Override the tag object a REST ref read reports, per tag name. */
   refObject?: Record<string, string>;
+  /** When the branch last moved (GitHub's activity record). */
+  branchMovedAt?: string;
 }
 
 /**
@@ -174,6 +176,11 @@ function fakeGitHub(opts: FakeOpts) {
               },
             }
           : { status: 404, body: { message: "Not Found" } };
+      }
+      if (method === "GET" && url.includes("/activity?")) {
+        return {
+          body: [{ timestamp: opts.branchMovedAt ?? "2026-09-15T00:00:00Z" }],
+        };
       }
       if (method === "GET" && url.includes("/rules/branches/")) {
         return opts.unprotected
@@ -804,8 +811,8 @@ test("fail closed: a version tag that does not resolve to a commit skips the rep
   }
 });
 
-test("fail closed: on push, a commit whose PR is not indexed yet holds tagging", async () => {
-  const { m } = withFake({
+test("fail closed: on push, a commit whose PR is not indexed yet (and newer) waits", async () => {
+  const { gh, m } = withFake({
     tags: [{ name: "v0.0.9", commit: H("s4") }],
     repo: {
       staging: null,
@@ -827,8 +834,14 @@ test("fail closed: on push, a commit whose PR is not indexed yet holds tagging",
       live: true,
       ledger: memLedger(),
     });
-    assert.equal(writes(m.calls).length, 0);
+    // The unindexed commit (and anything newer) waits; the older merge is
+    // tagged.
+    assert.deepEqual(r.channels[0].created, ["v0.1.0"]);
     assert.match(r.channels[0].note ?? "", /not indexed yet/);
+    assert.equal(
+      gh.tags.some((t) => t.commit === H("m2")),
+      false,
+    );
   } finally {
     m.restore();
   }
@@ -1555,11 +1568,11 @@ test("with the budget spent, a channel is not even read", async () => {
   }
 });
 
-test("nightly grace: a PR-less commit younger than an hour waits; an old one is tagged", async () => {
-  const young = new Date(Date.now() - 5 * 60_000).toISOString();
-  const mk = (date: string) =>
+test("grace: a PR-less commit on a branch that just moved waits, older merges are still tagged", async () => {
+  const mk = (movedAt: string) =>
     withFake({
       tags: [{ name: "v0.0.9", commit: H("s4") }],
+      branchMovedAt: movedAt,
       repo: {
         staging: null,
         defaultBranchRef: {
@@ -1567,26 +1580,52 @@ test("nightly grace: a PR-less commit younger than an hour waits; an old one is 
           target: {
             history: {
               pageInfo: { hasNextPage: false },
-              nodes: [node("m1", null, "main", date)],
+              // newest first: an unindexed direct push on top of two merges
+              nodes: [node("direct", null), node("m2", 20), node("m1", 10)],
             },
           },
         },
       },
     });
-  const a = mk(young);
+  const recent = mk(new Date(Date.now() - 5 * 60_000).toISOString());
   try {
     const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", live());
-    assert.equal(writes(a.m.calls).length, 0);
+    assert.deepEqual(r.channels[0].created, ["v0.1.0", "v0.2.0"]);
     assert.match(r.channels[0].note ?? "", /not indexed yet/);
+    assert.equal(
+      recent.gh.tags.some((t) => t.commit === H("direct")),
+      false,
+    );
   } finally {
-    a.m.restore();
+    recent.m.restore();
   }
-  const b = mk("2026-09-15T00:00:00Z");
+  const quiet = mk("2026-09-15T00:00:00Z");
   try {
     const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", live());
-    assert.deepEqual(r.channels[0].created, ["v0.1.0"]);
+    assert.deepEqual(r.channels[0].created, ["v0.1.0", "v0.2.0", "v0.3.0"]);
   } finally {
-    b.m.restore();
+    quiet.m.restore();
+  }
+});
+
+test("repair: a permanently failing entry is dropped after bounded attempts", async () => {
+  const ledger = memLedger([entry("v0.3.0", H("m3"), { attempts: 9 })]);
+  const fake = fakeGitHub({
+    tags: [{ name: "v0.3.0", commit: H("m3") }],
+    repo: { staging: null, workflows: tree() },
+  });
+  const m = mockFetch((method, url, body) => {
+    if (method === "GET" && url.includes("/releases?")) return { body: [] };
+    if (method === "POST" && url.endsWith("/releases"))
+      return { status: 422, body: { message: "Validation Failed" } };
+    return fake.route(method, url, body);
+  });
+  try {
+    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", live({ ledger }));
+    assert.deepEqual(ledger.pending, []);
+    assert.match(r.errors.join(" "), /giving up after 10 attempts/);
+  } finally {
+    m.restore();
   }
 });
 
