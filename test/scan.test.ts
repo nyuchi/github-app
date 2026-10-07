@@ -1016,31 +1016,6 @@ test("release repair: only ledger tags; a hand-made tag without a release is nev
   }
 });
 
-test("release repair: an existing release, drafts included, clears the ledger without a duplicate", async () => {
-  const ledger = memLedger([entry("v0.3.0", H("m3"))]);
-  const fake = fakeGitHub({
-    tags: [{ name: "v0.3.0", commit: H("m3") }],
-    repo: { staging: null, workflows: tree() },
-  });
-  const m = mockFetch((method, url, body) => {
-    if (method === "GET" && url.includes("/releases?")) {
-      return { body: [{ tag_name: "v0.3.0", draft: true }] };
-    }
-    return fake.route(method, url, body);
-  });
-  try {
-    await scanRepo(testEnv(), "tok", "nyuchi", "x", live({ ledger }));
-    assert.equal(
-      m.calls.filter((c) => c.method === "POST" && c.url.endsWith("/releases"))
-        .length,
-      0,
-    );
-    assert.deepEqual(ledger.pending, []);
-  } finally {
-    m.restore();
-  }
-});
-
 test("release repair: channel comes from the tag; staging betas do not take 'latest' from main", async () => {
   const ledger = memLedger([
     entry("v1.2.5", H("m3"), { prerelease: true, latest: false }),
@@ -1100,34 +1075,6 @@ test("release repair: channel comes from the tag; staging betas do not take 'lat
     assert.equal((rel.body as { make_latest: string }).make_latest, "true");
   } finally {
     m2.restore();
-  }
-});
-
-test("release repair: a release list that cannot be read in full leaves the ledger alone", async () => {
-  const ledger = memLedger([entry("v0.3.0", H("m3"))]);
-  const fake = fakeGitHub({
-    tags: [{ name: "v0.3.0", commit: H("m3") }],
-    repo: { staging: null, workflows: tree() },
-  });
-  const m = mockFetch((method, url, body) => {
-    if (method === "GET" && url.includes("/releases?")) {
-      return {
-        body: [{ tag_name: "other" }],
-        headers: { link: '<https://api.github.test/next>; rel="next"' },
-      };
-    }
-    return fake.route(method, url, body);
-  });
-  try {
-    await scanRepo(testEnv(), "tok", "nyuchi", "x", live({ ledger }));
-    assert.equal(
-      m.calls.filter((c) => c.method === "POST" && c.url.endsWith("/releases"))
-        .length,
-      0,
-    );
-    assert.deepEqual(ledger.pending, ["v0.3.0"]);
-  } finally {
-    m.restore();
   }
 });
 
@@ -1887,49 +1834,48 @@ test("a waiting channel shows how many releases wait", () => {
   assert.match(line ?? "", /\+2 pending/);
 });
 
-test("repair: a draft older than the tag (Release Drafter) is still found; no duplicate", async () => {
-  const ledger = memLedger([entry("v0.2.0", H("m2"), { at: Date.now() })]);
-  const fake = fakeGitHub({
-    tags: [{ name: "v0.2.0", commit: H("m2") }],
+test("repair: a published release clears the entry; a draft does not stop the published one", async () => {
+  // Published already: dropped, nothing created.
+  const l1 = memLedger([entry("v0.3.0", H("m3"))]);
+  const f1 = withFake({
+    tags: [{ name: "v0.3.0", commit: H("m3") }],
     repo: { staging: null, workflows: tree() },
-  });
-  const m = mockFetch((method, url, body) => {
-    if (method === "GET" && url.includes("/releases?")) {
-      return {
-        body: [
-          {
-            tag_name: "v0.3.0-beta",
-            draft: false,
-            created_at: new Date(Date.now() - 2 * 86_400_000).toISOString(),
-          },
-          {
-            tag_name: "v0.2.0",
-            draft: true,
-            created_at: new Date(Date.now() - 5 * 86_400_000).toISOString(),
-          },
-        ],
-      };
-    }
-    return fake.route(method, url, body);
+    releaseExists: true,
   });
   try {
-    await scanRepo(testEnv(), "tok", "nyuchi", "x", live({ ledger }));
+    await scanRepo(testEnv(), "tok", "nyuchi", "x", live({ ledger: l1 }));
+    assert.deepEqual(await l1.list(), []);
     assert.equal(
-      m.calls.filter(
-        (c) =>
-          c.method === "POST" &&
-          c.url.endsWith("/releases") &&
-          (c.body as { tag_name?: string }).tag_name === "v0.2.0",
+      f1.m.calls.filter(
+        (c) => c.method === "POST" && c.url.endsWith("/releases"),
       ).length,
       0,
     );
-    assert.deepEqual(await ledger.list(), []);
   } finally {
-    m.restore();
+    f1.m.restore();
+  }
+  // Only a draft (Release Drafter's) exists: GET /releases/tags 404s, so
+  // the published release is made, as for a new tag.
+  const l2 = memLedger([entry("v0.3.0", H("m3"))]);
+  const f2 = withFake({
+    tags: [{ name: "v0.3.0", commit: H("m3") }],
+    repo: { staging: null, workflows: tree() },
+  });
+  try {
+    const r = await scanRepo(
+      testEnv(),
+      "tok",
+      "nyuchi",
+      "x",
+      live({ ledger: l2 }),
+    );
+    assert.deepEqual(r.repaired, ["v0.3.0"]);
+  } finally {
+    f2.m.restore();
   }
 });
 
-test("repair: a per-repository read that fails counts a transient run for every entry", async () => {
+test("repair: absent refs are cleared before any shared read; a failing shared read is counted, classified", async () => {
   const ledger = memLedger([
     entry("v0.2.0", H("m2")),
     entry("v0.3.0", H("m3")),
@@ -1940,20 +1886,44 @@ test("repair: a per-repository read that fails counts a transient run for every 
   });
   let repairing = false;
   const m = mockFetch((method, url, body) => {
-    const q = (body as { query?: string } | undefined)?.query ?? "";
-    // Fail the batched facts query that repair runs before its loop.
-    if (repairing && /c1: object/.test(q))
+    if (method === "GET" && url.includes("/git/ref/tags/")) repairing = true;
+    if (repairing && method === "GET" && url.includes("/rules/branches/")) {
       return { status: 502, body: { message: "Bad Gateway" } };
-    if (method === "GET" && url.includes("/rules/branches/")) repairing = true;
+    }
     return fake.route(method, url, body);
   });
   try {
     await scanRepo(testEnv(), "tok", "nyuchi", "x", live({ ledger }));
     const after = await ledger.list();
     assert.deepEqual(
-      after.map((e) => e.transient),
-      [1, 1],
+      after.map((e) => [e.tag, e.transient]),
+      [["v0.3.0", 1]],
     );
+  } finally {
+    m.restore();
+  }
+});
+
+test("repair: workflow facts are queried in batches, never one huge query", async () => {
+  const many = Array.from({ length: 25 }, (_, i) =>
+    entry(`v0.${i + 1}.0`, H(`c${i}`)),
+  );
+  const ledger = memLedger(many);
+  const fake = fakeGitHub({
+    tags: many.map((e) => ({ name: e.tag, commit: e.commit })),
+    repo: { staging: null, workflows: tree() },
+  });
+  const m = mockFetch((method, url, body) => fake.route(method, url, body));
+  try {
+    await scanRepo(testEnv(), "tok", "nyuchi", "x", live({ ledger }));
+    const factQueries = m.calls.filter((c) =>
+      /c\d+: object\(oid/.test(JSON.stringify(c.body ?? "")),
+    );
+    for (const q of factQueries) {
+      const n = (JSON.stringify(q.body).match(/c\d+: object\(oid/g) ?? [])
+        .length;
+      assert.ok(n <= 10, `a facts query asked for ${n} commits`);
+    }
   } finally {
     m.restore();
   }

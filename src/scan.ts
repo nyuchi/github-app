@@ -350,14 +350,14 @@ export interface LedgerEntry {
   attempts?: number;
   /** Runs where GitHub could not answer (rate limit, 5xx, network). */
   transient?: number;
-  /** When the entry was written (ms since epoch). */
-  at?: number;
 }
 
 /** Stuck runs per ledger entry before it is dropped and reported. */
 const MAX_REPAIR_ATTEMPTS = 10;
 /** Runs GitHub could not answer before an entry is dropped (about a month). */
 const MAX_TRANSIENT_RUNS = 30;
+/** Commits per workflow-facts query in repair (the scan path is capped too). */
+const FACTS_BATCH = 10;
 
 /**
  * The repository's record of tags THIS APP is writing or wrote without a
@@ -725,7 +725,6 @@ async function scanChannel(
         tag: t.tag,
         object,
         commit: t.commit,
-        at: Date.now(),
         prerelease: t.prerelease,
         latest: t.latest,
         pr: t.pr,
@@ -1054,36 +1053,6 @@ export async function createTagRef(
   });
 }
 
-/**
- * Draft releases, read once per repair pass: drafts are not answered by
- * GET /releases/tags/{tag}, and a draft may be older than the tag (made
- * ahead by a person or Release Drafter), so the whole list is read, up to
- * 10 pages. null when it is longer: then no draft can be ruled out.
- */
-async function draftTags(
-  env: Env,
-  token: string,
-  owner: string,
-  name: string,
-): Promise<Set<string> | null> {
-  const drafts = new Set<string>();
-  let url: string | null = `/repos/${owner}/${name}/releases?per_page=100`;
-  for (let i = 0; url && i < 10; i++) {
-    const res: GhResponse = await gh(env, token, url);
-    if (!Array.isArray(res.body)) {
-      throw new AppError("releases could not be read", 502);
-    }
-    for (const r of res.body as { tag_name?: unknown; draft?: unknown }[]) {
-      if (r.draft === true && typeof r.tag_name === "string") {
-        drafts.add(r.tag_name);
-      }
-    }
-    const m = /<([^>]+)>;\s*rel="next"/.exec(res.headers.get("link") || "");
-    url = m ? m[1] : null;
-  }
-  return url ? null : drafts;
-}
-
 type Outcome = { outcome: "done" | "stuck" | "transient"; why: string };
 
 /**
@@ -1091,15 +1060,17 @@ type Outcome = { outcome: "done" | "stuck" | "transient"; why: string };
  * release, when every proof still holds:
  * - the live tag of that name points at the very tag object recorded (a tag
  *   object's sha hashes its content, so it still names the recorded commit);
+ * - it has no published release yet (GET /releases/tags/{tag}; a DRAFT is
+ *   not a release, so a draft for the tag, from Release Drafter say, does
+ *   not stop the published one, the same as for a new tag);
  * - the commit is still on one of the protected release branches;
- * - no release exists for it yet, drafts included (if one does, drop it);
  * - the commit's workflows would not start on a release.
  * Channel, "latest" and the PR come from the ledger entry, recorded when the
  * tag was planned.
  *
- * Failures are sorted: "transient" (rate limit, 5xx, the network) and
- * "stuck" (anything else). Both are bounded, transient far more loosely, so
- * nothing retries forever; every give-up is reported.
+ * Failures are sorted: "transient" (rate limit, 5xx, the network, a runtime
+ * error) and "stuck" (anything else). Both are bounded, transient far more
+ * loosely, so nothing retries forever; every give-up is reported.
  */
 export async function repairReleases(
   env: Env,
@@ -1116,56 +1087,73 @@ export async function repairReleases(
   if (!pending.length) return [];
   const repaired: string[] = [];
 
-  // Per-repository reads, once. If they fail, every entry has a transient
-  // run counted, so a read that keeps failing still ends (and is reported).
-  const protectedBranches: string[] = [];
-  let facts: Map<string, WorkflowFacts>;
-  let live: TagRef[];
-  try {
-    for (const b of branches) {
-      if (await branchIsProtected(env, token, owner, name, b)) {
-        protectedBranches.push(b);
+  // Per-repository reads, done lazily once an entry passes its own cheap
+  // checks, and once. A failure there is classified like any other and
+  // counted for the entry that needed it.
+  let shared:
+    | {
+        protectedBranches: string[];
+        facts: Map<string, WorkflowFacts>;
+        live: TagRef[];
       }
+    | undefined;
+  let sharedError: unknown;
+  const sharedReads = async () => {
+    if (sharedError) throw sharedError;
+    if (shared) return shared;
+    try {
+      const protectedBranches: string[] = [];
+      for (const b of branches) {
+        if (await branchIsProtected(env, token, owner, name, b))
+          protectedBranches.push(b);
+      }
+      // Batched like the scan path, so a long ledger is never one huge query.
+      const facts = new Map<string, WorkflowFacts>();
+      const commits = [...new Set(pending.map((e) => e.commit))];
+      for (let i = 0; i < commits.length; i += FACTS_BATCH) {
+        const part = await commitFacts(
+          env,
+          token,
+          owner,
+          name,
+          commits.slice(i, i + FACTS_BATCH),
+        );
+        for (const [k, v] of part) facts.set(k, v);
+      }
+      // Fresh, joined with this run's own writes: "newer" must see tags made
+      // by anyone during the run, and our own even if the index lags.
+      const fresh = await allTags(env, token, owner, name);
+      for (const t of tags)
+        if (!fresh.some((x) => x.name === t.name)) fresh.push(t);
+      shared = { protectedBranches, facts, live: versionTags(fresh, prefix) };
+      return shared;
+    } catch (err) {
+      sharedError = err;
+      throw err;
     }
-    facts = await commitFacts(
-      env,
-      token,
-      owner,
-      name,
-      pending.map((e) => e.commit),
-    );
-    // Fresh, joined with this run's own writes: "newer" must see tags made
-    // by anyone during the run, and our own even if the index lags.
-    const fresh = await allTags(env, token, owner, name);
-    for (const t of tags)
-      if (!fresh.some((x) => x.name === t.name)) fresh.push(t);
-    live = versionTags(fresh, prefix);
-  } catch (err) {
-    for (const e of pending)
-      await count(e, { outcome: "transient", why: msg(err) });
-    return repaired;
-  }
-  // Read lazily, once; a failed read is remembered, not repeated per entry.
-  let drafts: Set<string> | null | undefined;
-  let draftsError: unknown;
+  };
 
   for (const e of pending) {
     let r: Outcome;
     try {
       r = await repairOne(e);
     } catch (err) {
-      const why = msg(err);
-      const st = err instanceof AppError ? err.status : -1;
-      const transient =
-        st === 429 ||
-        (st === 403 && /rate limit/i.test(why)) ||
-        st >= 500 ||
-        !(err instanceof AppError);
-      r = { outcome: transient ? "transient" : "stuck", why };
+      r = classify(err);
     }
     if (r.outcome !== "done") await count(e, r);
   }
   return repaired;
+
+  function classify(err: unknown): Outcome {
+    const why = msg(err);
+    const st = err instanceof AppError ? err.status : -1;
+    const transient =
+      st === 429 ||
+      (st === 403 && /rate limit/i.test(why)) ||
+      st >= 500 ||
+      !(err instanceof AppError);
+    return { outcome: transient ? "transient" : "stuck", why };
+  }
 
   /** Count a failed run for one entry; give up (and report) at the bound. */
   async function count(e: LedgerEntry, r: Outcome): Promise<void> {
@@ -1217,30 +1205,12 @@ export async function repairReleases(
         token,
         `/repos/${owner}/${name}/releases/tags/${encodeURIComponent(e.tag)}`,
       );
-      await ledger.remove(e.tag); // it has a release
+      await ledger.remove(e.tag); // it has a published release
       return { outcome: "done", why: "" };
     } catch (err) {
       if (!(err instanceof AppError) || err.status !== 404) throw err;
     }
-    if (draftsError) throw draftsError;
-    if (drafts === undefined) {
-      try {
-        drafts = await draftTags(env, token, owner, name);
-      } catch (err) {
-        draftsError = err;
-        throw err;
-      }
-    }
-    if (drafts === null) {
-      return {
-        outcome: "stuck",
-        why: "more than 1,000 releases; a draft cannot be ruled out",
-      };
-    }
-    if (drafts.has(e.tag)) {
-      await ledger.remove(e.tag);
-      return { outcome: "done", why: "" };
-    }
+    const { protectedBranches, facts, live } = await sharedReads();
     let reachable = false;
     for (const b of protectedBranches) {
       if (await onBranch(env, token, owner, name, e.commit, b)) {
