@@ -235,3 +235,28 @@ test("ping answers pong", async () => {
   );
   assert.deepEqual(await res.json(), { ok: true, pong: true });
 });
+
+test("provenance: nothing from the push payload but repo and channel reaches tagging", async () => {
+  const foreign = "f".repeat(40);
+  const m = mockFetch((_method, url) => {
+    if (url.endsWith("/access_tokens"))
+      return { status: 201, body: { token: "inst" } };
+    return { body: { data: { repository: null } } };
+  });
+  try {
+    waits.length = 0;
+    const p = push("refs/heads/main", {
+      after: foreign,
+      head_commit: { id: foreign },
+      commits: [{ id: foreign }],
+    });
+    await handleWebhook(delivery("push", p), testEnv(), ctx);
+    await Promise.all(waits);
+    assert.equal(
+      m.calls.some((c) => JSON.stringify(c).includes(foreign)),
+      false,
+    );
+  } finally {
+    m.restore();
+  }
+});

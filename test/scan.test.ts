@@ -13,10 +13,13 @@ import {
 } from "../src/scan";
 import type { PlannedTag } from "../src/tagging";
 import { type Call, mockFetch, testEnv } from "./helpers";
+import type { LedgerEntry, ScanOptions } from "../src/scan";
 
 /** A 40-hex commit id with a readable name. */
 const H = (name: string) => createHash("sha1").update(name).digest("hex");
 const short = (name: string) => H(name).slice(0, 7);
+/** The (hex) id of the annotated tag object for a tag name. */
+const O = (tag: string) => H(`obj-${tag}`);
 
 const node = (name: string, pr: number | null, base = "main") => ({
   oid: H(name),
@@ -62,6 +65,8 @@ interface FakeOpts {
   /** Tag object as GET /git/tags/{sha} returns it. */
   tagObject?: { verified: boolean; email: string };
   releaseExists?: boolean;
+  /** The branch has no deletion/non-fast-forward rules. */
+  unprotected?: boolean;
 }
 
 /**
@@ -79,7 +84,7 @@ function fakeGitHub(opts: FakeOpts) {
       name: t.name,
       target: {
         __typename: "Tag",
-        oid: `obj-${t.name}`,
+        oid: O(t.name),
         ...(t.message !== undefined ? { message: t.message } : {}),
         target: { __typename: "Commit", oid: t.commit },
       },
@@ -151,6 +156,11 @@ function fakeGitHub(opts: FakeOpts) {
         }
         return { body: { data: { repository } } };
       }
+      if (method === "GET" && url.includes("/rules/branches/")) {
+        return opts.unprotected
+          ? { body: [] }
+          : { body: [{ type: "deletion" }, { type: "non_fast_forward" }] };
+      }
       if (method === "GET" && url.includes("/compare/")) {
         return { body: { status: opts.compareStatus ?? "ahead" } };
       }
@@ -170,11 +180,11 @@ function fakeGitHub(opts: FakeOpts) {
       }
       if (method === "POST" && url.endsWith("/git/tags")) {
         const b = body as { tag: string; object: string; message: string };
-        tagObjects.set(`obj-${b.tag}`, {
+        tagObjects.set(O(b.tag), {
           commit: b.object,
           message: b.message,
         });
-        return { status: 201, body: { sha: `obj-${b.tag}` } };
+        return { status: 201, body: { sha: O(b.tag) } };
       }
       if (method === "POST" && url.endsWith("/git/refs")) {
         if (opts.refStatus) {
@@ -203,10 +213,20 @@ function withFake(opts: FakeOpts) {
   return { gh, m };
 }
 
+async function assertSkipped(p: Promise<{ skipped?: string }>, re: RegExp) {
+  const r = await p;
+  assert.match(r.skipped ?? "", re);
+}
+
 const writes = (calls: Call[]) =>
   calls.filter((c) => c.method === "POST" && !c.url.endsWith("/graphql"));
 
-const nightly = { trigger: "nightly" as const, live: true };
+const live = (extra: Partial<ScanOptions> = {}): ScanOptions => ({
+  trigger: "nightly",
+  live: true,
+  ledger: memLedger(),
+  ...extra,
+});
 
 // ---- Shapes ----------------------------------------------------------------
 
@@ -319,6 +339,7 @@ test("a push defers to the repo's own staging workflow", async () => {
       trigger: "push",
       only: "staging",
       live: true,
+      ledger: memLedger(),
     });
     assert.equal(r.channels.length, 1);
     assert.equal(r.channels[0].planned.length, 0);
@@ -338,6 +359,7 @@ test("live mode re-verifies, then creates the annotated tag, the ref and the rel
       trigger: "push",
       only: "main",
       live: true,
+      ledger: memLedger(),
     });
     assert.deepEqual(r.errors, []);
     assert.deepEqual(r.channels[0].created, ["v0.1.0", "v0.2.0", "v0.3.0"]);
@@ -346,11 +368,11 @@ test("live mode re-verifies, then creates the annotated tag, the ref and the rel
     assert.match(w[0].url, /\/repos\/nyuchi\/lic\/git\/tags$/);
     assert.deepEqual(w[0].body, {
       tag: "v0.1.0",
-      message: "v0.1.0\n\nTagged-by: nyuchi-github-app\n",
+      message: "v0.1.0\n\nPull-request: #10\nTagged-by: nyuchi-github-app\n",
       object: H("m1"),
       type: "commit",
     });
-    assert.deepEqual(w[1].body, { ref: "refs/tags/v0.1.0", sha: "obj-v0.1.0" });
+    assert.deepEqual(w[1].body, { ref: "refs/tags/v0.1.0", sha: O("v0.1.0") });
     assert.equal((w[2].body as { make_latest: string }).make_latest, "false");
     assert.equal((w[8].body as { make_latest: string }).make_latest, "true");
     // Before each write: a fresh tag read and a branch check.
@@ -381,7 +403,7 @@ test("TOCTOU: a version tag that lands on the commit after planning stops the wr
     },
   });
   try {
-    const r = await scanRepo(testEnv(), "tok", "nyuchi", "lic", nightly);
+    const r = await scanRepo(testEnv(), "tok", "nyuchi", "lic", live());
     assert.equal(writes(m.calls).length, 0, "nothing written on a stale plan");
     assert.match(r.errors.join(" "), /stale/);
     assert.deepEqual(
@@ -406,7 +428,7 @@ test("TOCTOU: a higher version appearing elsewhere after planning stops the writ
     },
   });
   try {
-    const r = await scanRepo(testEnv(), "tok", "nyuchi", "lic", nightly);
+    const r = await scanRepo(testEnv(), "tok", "nyuchi", "lic", live());
     assert.equal(writes(m.calls).length, 0);
     assert.match(
       r.errors.join(" "),
@@ -424,7 +446,7 @@ test("TOCTOU: a commit no longer on the branch (force-push) is not tagged", asyn
     compareStatus: "diverged",
   });
   try {
-    const r = await scanRepo(testEnv(), "tok", "nyuchi", "lic", nightly);
+    const r = await scanRepo(testEnv(), "tok", "nyuchi", "lic", live());
     assert.equal(writes(m.calls).length, 0);
     assert.match(r.errors.join(" "), /no longer on main/);
   } finally {
@@ -439,7 +461,7 @@ test("TOCTOU: the ref create is the atomic last guard; a 422 stops the branch", 
     refStatus: 422,
   });
   try {
-    const r = await scanRepo(testEnv(), "tok", "nyuchi", "lic", nightly);
+    const r = await scanRepo(testEnv(), "tok", "nyuchi", "lic", live());
     assert.deepEqual(r.channels[0].created, []);
     assert.match(r.errors.join(" "), /Reference already exists/);
     assert.equal(
@@ -497,10 +519,15 @@ test("a release failure after the tag still counts the tag (budget, report)", as
   );
   try {
     const budget = { remaining: 10 };
-    const r = await scanRepo(testEnv(), "tok", "nyuchi", "lic", {
-      ...nightly,
-      budget,
-    });
+    const r = await scanRepo(
+      testEnv(),
+      "tok",
+      "nyuchi",
+      "lic",
+      live({
+        budget,
+      }),
+    );
     assert.deepEqual(r.channels[0].created, ["v0.1.0", "v0.2.0", "v0.3.0"]);
     assert.equal(budget.remaining, 7);
     assert.match(r.errors.join(" "), /tag made, release failed/);
@@ -518,7 +545,7 @@ test("publish guard: a tag-triggered workflow only on the tagged commit (not HEA
     workflowsAt: { s5: [PUBLISH_ON_TAG] },
   });
   try {
-    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", nightly);
+    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", live());
     const staging = r.channels.find((c) => c.channel === "staging")!;
     assert.equal(staging.planned.length, 0);
     assert.match(
@@ -543,7 +570,7 @@ test("publish guard: an old merge whose workflows ran on any push is not backfil
     workflowsAt: { m1: [blob("rel.yml", "on: push\n")] },
   });
   try {
-    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", nightly);
+    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", live());
     assert.equal(writes(m.calls).length, 0);
     assert.match(r.channels[0].note ?? "", /starts on tags or releases/);
   } finally {
@@ -560,7 +587,7 @@ test("fail closed: a commit GitHub cannot find, or a non-Commit object, is never
     missingCommits: [H("m1")],
   });
   try {
-    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", nightly);
+    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", live());
     assert.equal(writes(m.calls).length, 0);
     assert.match(r.channels[0].note ?? "", /starts on tags or releases/);
   } finally {
@@ -575,7 +602,7 @@ test("fail closed: an unexpected response shape for the workflow check tags noth
     badWorkflowShape: true,
   });
   try {
-    await scanRepo(testEnv(), "tok", "nyuchi", "x", nightly);
+    await scanRepo(testEnv(), "tok", "nyuchi", "x", live());
     assert.equal(writes(m.calls).length, 0);
   } finally {
     m.restore();
@@ -625,7 +652,7 @@ test("fail closed: an odd default-branch workflows shape blocks the repo", async
     repo: { workflows: { __typename: "Blob" } },
   });
   try {
-    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", nightly);
+    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", live());
     assert.equal(writes(m.calls).length, 0);
     assert.match(
       r.channels.map((c) => c.note).join(" "),
@@ -668,10 +695,15 @@ test("fail closed: BACKFILL_SINCE must be strict ISO-8601", () => {
 test("fail closed: a bad BACKFILL_SINCE reads and writes nothing", async () => {
   const { m } = withFake({ tags: [{ name: "v0.0.9", commit: H("s4") }] });
   try {
-    await assert.rejects(
-      scanRepo(testEnv({ BACKFILL_SINCE: "1" }), "tok", "nyuchi", "x", nightly),
-      /BACKFILL_SINCE/,
+    // scanRepo never throws: the repository is skipped with the reason.
+    const r = await scanRepo(
+      testEnv({ BACKFILL_SINCE: "1" }),
+      "tok",
+      "nyuchi",
+      "x",
+      live(),
     );
+    assert.match(r.skipped ?? "", /BACKFILL_SINCE/);
     assert.equal(m.calls.length, 0);
   } finally {
     m.restore();
@@ -686,8 +718,8 @@ test("fail closed: a mistyped limit stops tagging instead of becoming another li
   ] as const) {
     const m = mockFetch(() => ({ body: {} }));
     try {
-      await assert.rejects(
-        scanRepo(testEnv({ [k]: v }), "tok", "nyuchi", "x", nightly),
+      await assertSkipped(
+        scanRepo(testEnv({ [k]: v }), "tok", "nyuchi", "x", live()),
         new RegExp(k),
       );
       assert.equal(m.calls.length, 0);
@@ -705,7 +737,7 @@ test("fail closed: a mistyped limit stops tagging instead of becoming another li
       "tok",
       "nyuchi",
       "x",
-      nightly,
+      live(),
     );
     assert.equal(writes(m.calls).length, 0);
     assert.equal(r.channels[0].pending, 3);
@@ -739,7 +771,7 @@ test("fail closed: a version tag that does not resolve to a commit skips the rep
     return res;
   });
   try {
-    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", nightly);
+    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", live());
     assert.match(r.skipped ?? "", /does not resolve to a commit/);
     assert.equal(writes(m.calls).length, 0);
   } finally {
@@ -768,6 +800,7 @@ test("fail closed: on push, a commit whose PR is not indexed yet holds tagging",
       trigger: "push",
       only: "main",
       live: true,
+      ledger: memLedger(),
     });
     assert.equal(writes(m.calls).length, 0);
     assert.match(r.channels[0].note ?? "", /not indexed yet/);
@@ -814,7 +847,7 @@ test("history beyond the window with no tag in sight tags nothing (no stranded m
     return fake.route(method, url, body);
   });
   try {
-    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", nightly);
+    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", live());
     assert.equal(writes(m.calls).length, 0);
     assert.match(r.channels[0].note ?? "", /none tagged; not tagging/);
   } finally {
@@ -824,21 +857,26 @@ test("history beyond the window with no tag in sight tags nothing (no stranded m
 
 // ---- Release repair (ledger) ---------------------------------------------
 
-function memLedger(initial: string[] = []) {
+function memLedger(initial: LedgerEntry[] = []) {
   let pending = [...initial];
   return {
     get pending() {
-      return pending;
+      return pending.map((e) => e.tag);
     },
     list: async () => [...pending],
-    add: async (t: string) => {
-      if (!pending.includes(t)) pending.push(t);
+    add: async (e: LedgerEntry) => {
+      pending = [...pending.filter((x) => x.tag !== e.tag), e];
     },
     remove: async (t: string) => {
-      pending = pending.filter((x) => x !== t);
+      pending = pending.filter((x) => x.tag !== t);
     },
   };
 }
+const entry = (tag: string, commit: string): LedgerEntry => ({
+  tag,
+  object: O(tag),
+  commit,
+});
 
 test("a failed release is recorded in the ledger, then repaired on the next run", async () => {
   const ledger = memLedger();
@@ -855,17 +893,27 @@ test("a failed release is recorded in the ledger, then repaired on the next run"
     return fake.route(method, url, body);
   });
   try {
-    const first = await scanRepo(testEnv(), "tok", "nyuchi", "x", {
-      ...nightly,
-      ledger,
-    });
+    const first = await scanRepo(
+      testEnv(),
+      "tok",
+      "nyuchi",
+      "x",
+      live({
+        ledger,
+      }),
+    );
     assert.deepEqual(first.channels[0].created, ["v0.1.0", "v0.2.0", "v0.3.0"]);
     assert.deepEqual(ledger.pending, ["v0.1.0", "v0.2.0", "v0.3.0"]);
     failReleases = false;
-    const second = await scanRepo(testEnv(), "tok", "nyuchi", "x", {
-      ...nightly,
-      ledger,
-    });
+    const second = await scanRepo(
+      testEnv(),
+      "tok",
+      "nyuchi",
+      "x",
+      live({
+        ledger,
+      }),
+    );
     assert.deepEqual(second.repaired, ["v0.1.0", "v0.2.0", "v0.3.0"]);
     assert.deepEqual(ledger.pending, []);
     const rel = m.calls
@@ -888,10 +936,15 @@ test("release repair: only ledger tags; a hand-made tag without a release is nev
     releaseExists: false,
   });
   try {
-    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", {
-      ...nightly,
-      ledger,
-    });
+    const r = await scanRepo(
+      testEnv(),
+      "tok",
+      "nyuchi",
+      "x",
+      live({
+        ledger,
+      }),
+    );
     assert.equal(r.repaired, undefined);
     assert.equal(m.calls.filter((c) => c.url.includes("/releases")).length, 0);
   } finally {
@@ -900,7 +953,7 @@ test("release repair: only ledger tags; a hand-made tag without a release is nev
 });
 
 test("release repair: an existing release, drafts included, clears the ledger without a duplicate", async () => {
-  const ledger = memLedger(["v0.3.0"]);
+  const ledger = memLedger([entry("v0.3.0", H("m3"))]);
   const fake = fakeGitHub({
     tags: [{ name: "v0.3.0", commit: H("m3") }],
     repo: { staging: null, workflows: tree() },
@@ -912,7 +965,7 @@ test("release repair: an existing release, drafts included, clears the ledger wi
     return fake.route(method, url, body);
   });
   try {
-    await scanRepo(testEnv(), "tok", "nyuchi", "x", { ...nightly, ledger });
+    await scanRepo(testEnv(), "tok", "nyuchi", "x", live({ ledger }));
     assert.equal(
       m.calls.filter((c) => c.method === "POST" && c.url.endsWith("/releases"))
         .length,
@@ -925,7 +978,7 @@ test("release repair: an existing release, drafts included, clears the ledger wi
 });
 
 test("release repair: channel comes from the tag; staging betas do not take 'latest' from main", async () => {
-  const ledger = memLedger(["v1.2.5"]);
+  const ledger = memLedger([entry("v1.2.5", H("m3"))]);
   const fake = fakeGitHub({
     tags: [
       { name: "v1.2.5", commit: H("m3"), message: APP_MSG("v1.2.5", true) },
@@ -957,7 +1010,7 @@ test("release repair: channel comes from the tag; staging betas do not take 'lat
   } finally {
     m.restore();
   }
-  const ledger2 = memLedger(["v1.3.0"]);
+  const ledger2 = memLedger([entry("v1.3.0", H("m3"))]);
   const fake2 = fakeGitHub({
     tags: [
       { name: "v1.3.0", commit: H("m3"), message: APP_MSG("v1.3.0") },
@@ -971,10 +1024,15 @@ test("release repair: channel comes from the tag; staging betas do not take 'lat
       : fake2.route(method, url, body),
   );
   try {
-    await scanRepo(testEnv(), "tok", "nyuchi", "x", {
-      ...nightly,
-      ledger: ledger2,
-    });
+    await scanRepo(
+      testEnv(),
+      "tok",
+      "nyuchi",
+      "x",
+      live({
+        ledger: ledger2,
+      }),
+    );
     const rel = m2.calls.find(
       (c) => c.method === "POST" && c.url.endsWith("/releases"),
     )!;
@@ -985,7 +1043,7 @@ test("release repair: channel comes from the tag; staging betas do not take 'lat
 });
 
 test("release repair: a release list that cannot be read in full leaves the ledger alone", async () => {
-  const ledger = memLedger(["v0.3.0"]);
+  const ledger = memLedger([entry("v0.3.0", H("m3"))]);
   const fake = fakeGitHub({
     tags: [{ name: "v0.3.0", commit: H("m3") }],
     repo: { staging: null, workflows: tree() },
@@ -1000,7 +1058,7 @@ test("release repair: a release list that cannot be read in full leaves the ledg
     return fake.route(method, url, body);
   });
   try {
-    await scanRepo(testEnv(), "tok", "nyuchi", "x", { ...nightly, ledger });
+    await scanRepo(testEnv(), "tok", "nyuchi", "x", live({ ledger }));
     assert.equal(
       m.calls.filter((c) => c.method === "POST" && c.url.endsWith("/releases"))
         .length,
@@ -1024,7 +1082,7 @@ test("fail closed: a history page without pageInfo is an error, not 'complete'",
     },
   });
   try {
-    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", nightly);
+    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", live());
     assert.equal(writes(m.calls).length, 0);
     assert.match(r.errors.join(" "), /history of main could not be read/);
   } finally {
@@ -1032,16 +1090,16 @@ test("fail closed: a history page without pageInfo is an error, not 'complete'",
   }
 });
 
-test("the branch check names the branch unambiguously (heads/<branch>)", async () => {
+test("the branch check names the branch unambiguously (refs/heads/<branch>)", async () => {
   const { m } = withFake({
     tags: [{ name: "v0.0.9", commit: H("s4") }],
     repo: { staging: null },
   });
   try {
-    await scanRepo(testEnv(), "tok", "nyuchi", "x", nightly);
+    await scanRepo(testEnv(), "tok", "nyuchi", "x", live());
     const cmp = m.calls.filter((c) => c.url.includes("/compare/"));
     assert.ok(cmp.length > 0);
-    for (const c of cmp) assert.match(c.url, /\.\.\.heads\/main$/);
+    for (const c of cmp) assert.match(c.url, /\.\.\.refs\/heads\/main$/);
   } finally {
     m.restore();
   }
@@ -1079,10 +1137,15 @@ test("the nightly tag budget stops writes and reports the rest as pending", asyn
   });
   try {
     const budget = { remaining: 1 };
-    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", {
-      ...nightly,
-      budget,
-    });
+    const r = await scanRepo(
+      testEnv(),
+      "tok",
+      "nyuchi",
+      "x",
+      live({
+        budget,
+      }),
+    );
     assert.deepEqual(r.channels[0].created, ["v0.1.0"]);
     assert.equal(r.channels[0].pending, 2);
     assert.match(r.channels[0].note ?? "", /budget/);
@@ -1108,7 +1171,7 @@ test("publishing repos, foreign tags, forks, archives and excluded names are ski
   for (const [repo, tags, name, re] of cases) {
     const { m } = withFake({ repo, tags });
     try {
-      const r = await scanRepo(testEnv(), "tok", "nyuchi", name, nightly);
+      const r = await scanRepo(testEnv(), "tok", "nyuchi", name, live());
       const text = r.skipped ?? r.channels.map((c) => c.note).join(" ");
       assert.match(text, re);
       assert.equal(writes(m.calls).length, 0);
@@ -1129,6 +1192,163 @@ test("the query asks for history since BACKFILL_SINCE", async () => {
       .variables;
     assert.equal(vars.since, "2026-09-01T00:00:00.000Z");
     assert.equal(vars.staging, "refs/heads/staging");
+  } finally {
+    m.restore();
+  }
+});
+
+// ---- Security finding 5: provenance ----------------------------------------
+
+test("provenance: a commit not reachable from the protected branch head is never tagged", async () => {
+  const { gh, m } = withFake({
+    tags: [{ name: "v0.0.9", commit: H("s4") }],
+    repo: { staging: null },
+    compareStatus: "diverged",
+  });
+  try {
+    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", live());
+    assert.equal(writes(m.calls).length, 0);
+    assert.equal(gh.tags.length, 1);
+    assert.match(r.errors.join(" "), /no longer on main/);
+    for (const c of m.calls.filter((x) => x.url.includes("/compare/"))) {
+      assert.match(c.url, /\.\.\.refs\/heads\/main$/);
+    }
+  } finally {
+    m.restore();
+  }
+});
+
+test("provenance: an unprotected branch is not a release line", async () => {
+  const { m } = withFake({
+    tags: [{ name: "v0.0.9", commit: H("s4") }],
+    unprotected: true,
+  });
+  try {
+    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", live());
+    assert.equal(writes(m.calls).length, 0);
+    for (const c of r.channels)
+      assert.match(c.note ?? "", /no deletion and non-fast-forward rules/);
+  } finally {
+    m.restore();
+  }
+});
+
+test("provenance: tags are annotated, carry the merging PR, and the release links it", async () => {
+  const { m } = withFake({
+    tags: [{ name: "v0.0.9", commit: H("s4") }],
+    repo: { staging: null },
+  });
+  try {
+    await scanRepo(testEnv(), "tok", "nyuchi", "x", live());
+    const tagObj = m.calls.find(
+      (c) => c.method === "POST" && c.url.endsWith("/git/tags"),
+    )!;
+    const b = tagObj.body as Record<string, unknown>;
+    assert.equal(b.type, "commit");
+    assert.equal(
+      "tagger" in b,
+      false,
+      "GitHub records the App's bot as tagger",
+    );
+    assert.match(String(b.message), /^Pull-request: #10$/m);
+    const rel = m.calls.find(
+      (c) => c.method === "POST" && c.url.endsWith("/releases"),
+    )!;
+    assert.equal((rel.body as { body?: string }).body, "Merged in #10.");
+  } finally {
+    m.restore();
+  }
+});
+
+test("provenance: a ledger tag deleted and re-made by someone else is not repaired", async () => {
+  const ledger = memLedger([entry("v0.3.0", H("m3"))]);
+  // The live v0.3.0 is a different tag object (someone else's), same name.
+  const fake = fakeGitHub({
+    tags: [{ name: "v0.3.0", commit: H("m3") }],
+    repo: { staging: null, workflows: tree() },
+  });
+  const m = mockFetch((method, url, body) => {
+    const res = fake.route(method, url, body) as {
+      body: {
+        data?: {
+          repository?: { tags?: { nodes: { target: { oid: string } }[] } };
+        };
+      };
+    };
+    const q = (body as { query?: string } | undefined)?.query ?? "";
+    if (q.includes("query Repo(") || q.includes("query Tags(")) {
+      for (const n of res.body.data?.repository?.tags?.nodes ?? [])
+        n.target.oid = H("someone-else");
+    }
+    if (method === "GET" && url.includes("/releases?")) return { body: [] };
+    return res;
+  });
+  try {
+    await scanRepo(testEnv(), "tok", "nyuchi", "x", live({ ledger }));
+    assert.equal(
+      m.calls.filter((c) => c.method === "POST" && c.url.endsWith("/releases"))
+        .length,
+      0,
+    );
+    assert.deepEqual(ledger.pending, []);
+  } finally {
+    m.restore();
+  }
+});
+
+test("provenance: write-ahead ledger; a lost ref response is repaired later, never lost", async () => {
+  const ledger = memLedger();
+  const fake = fakeGitHub({
+    tags: [{ name: "v0.0.9", commit: H("s4") }],
+    repo: { staging: null, workflows: tree() },
+  });
+  let loseRef = true;
+  const m = mockFetch((method, url, body) => {
+    if (method === "POST" && url.endsWith("/git/refs") && loseRef) {
+      fake.route(method, url, body); // GitHub applied it...
+      return { status: 504, body: { message: "Gateway Timeout" } }; // ...but we never heard
+    }
+    if (method === "GET" && url.includes("/releases?")) return { body: [] };
+    return fake.route(method, url, body);
+  });
+  try {
+    const first = await scanRepo(
+      testEnv(),
+      "tok",
+      "nyuchi",
+      "x",
+      live({ ledger }),
+    );
+    // The run did not hear back, so it did not count the tag...
+    assert.deepEqual(first.channels[0].created, []);
+    // ...but the write-ahead entry let the same run's repair find the live
+    // tag (the very object recorded) and give it its release.
+    assert.deepEqual(first.repaired, ["v0.1.0"]);
+    assert.deepEqual(ledger.pending, []);
+    loseRef = false;
+    const second = await scanRepo(
+      testEnv(),
+      "tok",
+      "nyuchi",
+      "x",
+      live({ ledger }),
+    );
+    assert.deepEqual(second.channels[0].created, ["v0.2.0", "v0.3.0"]);
+    assert.deepEqual(ledger.pending, []);
+  } finally {
+    m.restore();
+  }
+});
+
+test("provenance: a live run without the release ledger writes nothing", async () => {
+  const { m } = withFake({ tags: [{ name: "v0.0.9", commit: H("s4") }] });
+  try {
+    const r = await scanRepo(testEnv(), "tok", "nyuchi", "x", {
+      trigger: "nightly",
+      live: true,
+    });
+    assert.match(r.skipped ?? "", /ledger/);
+    assert.equal(m.calls.length, 0);
   } finally {
     m.restore();
   }

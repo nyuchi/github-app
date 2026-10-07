@@ -18,7 +18,7 @@
 
 import type { Env } from "./env";
 import { repoExcluded } from "./env";
-import { AppError, gh, graphql } from "./app";
+import { AppError, gh, type GhResponse, graphql } from "./app";
 import {
   type Channel,
   type Commit,
@@ -302,7 +302,7 @@ export function toCommits(
 }
 
 // ---------------------------------------------------------------------------
-// Reports
+// Reports and options
 // ---------------------------------------------------------------------------
 
 export interface ChannelReport {
@@ -323,6 +323,28 @@ export interface RepoReport {
   repaired?: string[];
 }
 
+/** One tag this app wrote, as recorded before its ref was created. */
+export interface LedgerEntry {
+  tag: string;
+  /** The annotated tag object this app created (the provenance). */
+  object: string;
+  commit: string;
+}
+
+/**
+ * The repository's record of tags THIS APP is writing or wrote without a
+ * release yet, kept in its TagLock Durable Object storage. An entry is added
+ * after the tag object exists and before its ref is created (write-ahead),
+ * and removed once the release exists. Repair trusts an entry only while the
+ * live tag still points at the very tag object recorded: a tag deleted and
+ * re-made by anyone else, even under the same name, is not ours.
+ */
+export interface ReleaseLedger {
+  list(): Promise<LedgerEntry[]>;
+  add(entry: LedgerEntry): Promise<void>;
+  remove(tag: string): Promise<void>;
+}
+
 export interface ScanOptions {
   trigger: "push" | "nightly";
   /** Only this channel (a push); default both. */
@@ -330,22 +352,15 @@ export interface ScanOptions {
   live: boolean;
   /** Tags this run may still create (nightly). */
   budget?: { remaining: number };
-  /**
-   * Tags THIS APP made whose release creation failed, kept in the
-   * repository's TagLock Durable Object storage. Only these are ever
-   * repaired: a record of our own writes is the provenance (a tag message
-   * or tagger can be forged; this record cannot).
-   */
+  /** Required for writes; see ReleaseLedger. */
   ledger?: ReleaseLedger;
 }
 
-export interface ReleaseLedger {
-  list(): Promise<string[]>;
-  add(tag: string): Promise<void>;
-  remove(tag: string): Promise<void>;
-}
-
 const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+/** BACKFILL_MAX_PER_REPO, parsed in one place for the scan and the nightly. */
+export const maxPerRepo = (env: Env) =>
+  intSetting("BACKFILL_MAX_PER_REPO", env.BACKFILL_MAX_PER_REPO, 10, 0, 1000);
 
 // ---------------------------------------------------------------------------
 // The scan
@@ -354,9 +369,15 @@ const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 /**
  * Plan, and in live mode apply, the tags one repository is missing.
  *
- * Throws only BEFORE anything is written (bad settings, the first read).
- * Once writing may have started, every failure lands in `errors` and the
- * report still lists what was created, so callers can account for it.
+ * NEVER THROWS. Anything that stops the repository before a write is
+ * `skipped` with the reason; anything after is in `errors`, and the report
+ * still lists every tag created, so the caller can account for it.
+ *
+ * PROVENANCE. Every commit tagged comes from this app's own authenticated
+ * reads of a branch that GitHub reports as protected (deletion and
+ * non-fast-forward rules), and is re-proven reachable from that branch's
+ * head immediately before the write. Nothing is taken from a webhook
+ * payload except which repository and which channel to look at.
  */
 export async function scanRepo(
   env: Env,
@@ -365,21 +386,43 @@ export async function scanRepo(
   name: string,
   opts: ScanOptions,
 ): Promise<RepoReport> {
-  const repo = `${owner}/${name}`;
-  const report: RepoReport = { repo, channels: [], errors: [] };
+  const report: RepoReport = {
+    repo: `${owner}/${name}`,
+    channels: [],
+    errors: [],
+  };
   if (repoExcluded(env, name))
     return { ...report, skipped: "excluded by name" };
+  if (opts.live && !opts.ledger) {
+    return {
+      ...report,
+      skipped: "a live run needs the release ledger (TagLock)",
+    };
+  }
+  try {
+    await scanInner(env, token, owner, name, opts, report);
+  } catch (e) {
+    // Before any write: the whole repository is skipped.
+    if (!report.channels.some((c) => c.created.length)) {
+      return { ...report, skipped: msg(e) };
+    }
+    report.errors.push(msg(e));
+  }
+  return report;
+}
 
+async function scanInner(
+  env: Env,
+  token: string,
+  owner: string,
+  name: string,
+  opts: ScanOptions,
+  report: RepoReport,
+): Promise<void> {
   const prefix = env.TAG_PREFIX || "v";
   const stagingName = env.STAGING_BRANCH || "staging";
   const hist = intSetting("SCAN_HISTORY", env.SCAN_HISTORY, 50, 1, 100);
-  const max = intSetting(
-    "BACKFILL_MAX_PER_REPO",
-    env.BACKFILL_MAX_PER_REPO,
-    10,
-    0,
-    1000,
-  );
+  const max = maxPerRepo(env);
   const since = sinceIso(env);
 
   const data = await graphql<RepoData>(env, token, REPO_QUERY, {
@@ -391,25 +434,35 @@ export async function scanRepo(
     tagsAfter: null,
   });
   const r = data.repository;
-  if (!r) return { ...report, skipped: "not found" };
-  if (r.isArchived || r.isDisabled) return { ...report, skipped: "archived" };
-  if (r.isFork) return { ...report, skipped: "fork" };
-  if (r.isEmpty || !r.defaultBranchRef) return { ...report, skipped: "empty" };
+  if (!r || typeof r !== "object") {
+    report.skipped = "not found";
+    return;
+  }
+  if (r.isArchived !== false || r.isDisabled !== false) {
+    report.skipped = "archived or disabled (or unknown)";
+    return;
+  }
+  if (r.isFork !== false) {
+    report.skipped = "fork (or unknown)";
+    return;
+  }
+  if (r.isEmpty !== false || !r.defaultBranchRef?.name) {
+    report.skipped = "empty";
+    return;
+  }
 
   const tags = await allTags(env, token, owner, name, r.tags);
   if (foreignTagScheme(tags, prefix)) {
-    return { ...report, skipped: `tags do not follow ${prefix}<semver>` };
+    report.skipped = `tags do not follow ${prefix}<MAJOR.MINOR.PATCH>`;
+    return;
   }
   const unresolved = versionTags(tags, prefix).filter((t) => t.unresolved);
   if (unresolved.length) {
-    return {
-      ...report,
-      skipped: `version tag ${unresolved[0].name} does not resolve to a commit`,
-    };
+    report.skipped = `version tag ${unresolved[0].name} does not resolve to a commit`;
+    return;
   }
 
   const facts = treeFacts(r.workflows);
-
   const branches: { channel: Channel; node: BranchNode | null }[] = [
     { channel: "staging", node: r.staging },
     { channel: "main", node: r.defaultBranchRef },
@@ -417,6 +470,7 @@ export async function scanRepo(
   // A default branch called "staging" is a main line, not a beta line.
   if (r.defaultBranchRef.name === stagingName) branches.shift();
 
+  const made: TagRef[] = [];
   for (const { channel, node } of branches) {
     if (!node || (opts.only && opts.only !== channel)) continue;
     const entry: ChannelReport = {
@@ -436,13 +490,18 @@ export async function scanRepo(
         opts,
         entry,
         errors: report.errors,
+        made,
       });
     } catch (e) {
       report.errors.push(`${node.name}: ${msg(e)}`);
     }
   }
+
   if (opts.live && opts.ledger) {
     try {
+      const protectedBranches = branches
+        .map((b) => b.node?.name)
+        .filter((b): b is string => Boolean(b));
       const repaired = await repairReleases(
         env,
         token,
@@ -451,13 +510,13 @@ export async function scanRepo(
         tags,
         prefix,
         opts.ledger,
+        protectedBranches,
       );
       if (repaired.length) report.repaired = repaired;
     } catch (e) {
       report.errors.push(`release repair: ${msg(e)}`);
     }
   }
-  return report;
 }
 
 async function scanChannel(
@@ -476,6 +535,8 @@ async function scanChannel(
     opts: ScanOptions;
     entry: ChannelReport;
     errors: string[];
+    /** Every tag this run wrote, across channels (see assertStillValid). */
+    made: TagRef[];
   },
 ): Promise<void> {
   const { prefix, opts, entry } = c;
@@ -483,6 +544,13 @@ async function scanChannel(
   const decision = channelDecision(channel, facts, opts.trigger);
   if (!decision.tag) {
     entry.note = decision.reason;
+    return;
+  }
+
+  // Only a protected branch is a release line: its history cannot be
+  // rewritten or deleted under the tags.
+  if (!(await branchIsProtected(env, token, owner, name, node.name))) {
+    entry.note = `${node.name} has no deletion and non-fast-forward rules; not tagging`;
     return;
   }
 
@@ -556,12 +624,15 @@ async function scanChannel(
     return;
   }
 
-  const made: TagRef[] = [];
+  const ledger = opts.ledger!;
+  const repo = `${owner}/${name}`;
+  const made = c.made;
   for (const t of plan.tags) {
     if (opts.budget && opts.budget.remaining <= 0) {
       entry.note = "tonight's tag budget is spent; continues next run";
       break;
     }
+    let object: string;
     try {
       await assertStillValid(
         env,
@@ -573,36 +644,84 @@ async function scanChannel(
         node.name,
         made,
       );
-      await createTag(env, token, `${owner}/${name}`, t);
+      object = await createTagObject(env, token, repo, t);
+      await ledger.add({ tag: t.tag, object, commit: t.commit });
     } catch (e) {
       // Stop this branch: the next version depends on this one.
       c.errors.push(`${t.tag}: ${msg(e)}`);
       break;
     }
+    try {
+      await createTagRef(env, token, repo, t.tag, object);
+    } catch (e) {
+      // The ref may or may not exist (a lost response can hide a success).
+      // The ledger entry stays: repair keeps it only if the live tag points
+      // at exactly this object, and drops it otherwise. The budget assumes
+      // it was written.
+      c.errors.push(`${t.tag}: ${msg(e)}`);
+      if (opts.budget) opts.budget.remaining--;
+      break;
+    }
     if (opts.budget) opts.budget.remaining--;
     entry.created.push(t.tag);
-    const ref = { name: t.tag, commit: t.commit, message: tagMessage(t) };
+    const ref: TagRef = {
+      name: t.tag,
+      commit: t.commit,
+      object,
+      message: tagMessage(t),
+    };
     made.push(ref);
     tags.push(ref);
     try {
-      await createRelease(env, token, `${owner}/${name}`, {
+      await createRelease(env, token, repo, {
         tag: t.tag,
         prerelease: t.prerelease,
         latest: t.latest,
+        pr: t.pr,
       });
+      await ledger.remove(t.tag);
     } catch (e) {
-      // The tag stands; it is recorded so a later run repairs its release.
+      // The tag stands and stays in the ledger; a later run repairs it.
       c.errors.push(`${t.tag}: tag made, release failed: ${msg(e)}`);
-      try {
-        await opts.ledger?.add(t.tag);
-      } catch (le) {
-        c.errors.push(
-          `${t.tag}: could not record the missing release: ${msg(le)}`,
-        );
-      }
     }
   }
   entry.pending = plan.pending + (plan.tags.length - entry.created.length);
+}
+
+/** Does GitHub enforce deletion and non-fast-forward rules on this branch? */
+export async function branchIsProtected(
+  env: Env,
+  token: string,
+  owner: string,
+  name: string,
+  branch: string,
+): Promise<boolean> {
+  const { body } = await gh(
+    env,
+    token,
+    `/repos/${owner}/${name}/rules/branches/${encodeURIComponent(branch)}`,
+  );
+  if (!Array.isArray(body)) return false;
+  const types = new Set(body.map((r) => (r as { type?: unknown }).type));
+  return types.has("deletion") && types.has("non_fast_forward");
+}
+
+/** Is `commit` the head of `branch` or an ancestor of it? */
+export async function onBranch(
+  env: Env,
+  token: string,
+  owner: string,
+  name: string,
+  commit: string,
+  branch: string,
+): Promise<boolean> {
+  const { body } = await gh(
+    env,
+    token,
+    `/repos/${owner}/${name}/compare/${commit}...refs/heads/${encodeURIComponent(branch)}`,
+  );
+  const status = (body as { status?: unknown } | null)?.status;
+  return status === "ahead" || status === "identical";
 }
 
 /**
@@ -627,22 +746,29 @@ export async function readHistory(
   incomplete: boolean;
   stop?: TagRef;
 }> {
+  const validPage = (p: HistoryPage | undefined): p is HistoryPage =>
+    Boolean(
+      p &&
+      Array.isArray(p.nodes) &&
+      p.nodes.every(
+        (n) => typeof n?.oid === "string" && /^[0-9a-f]{40}$/i.test(n.oid),
+      ) &&
+      p.pageInfo &&
+      typeof p.pageInfo.hasNextPage === "boolean",
+    );
   const vt = versionTags(tags, prefix);
   const tagOf = (oid: string) => vt.find((t) => t.commit === oid);
-  const first = node.target?.history;
-  if (
-    !first ||
-    !Array.isArray(first.nodes) ||
-    !first.pageInfo ||
-    typeof first.pageInfo.hasNextPage !== "boolean"
-  ) {
+
+  let page: HistoryPage | undefined = node.target?.history;
+  if (!validPage(page))
     throw new AppError(`history of ${node.name} could not be read`, 502);
-  }
-  const nodes: HistoryNode[] = [...first.nodes];
-  let info: HistoryPage["pageInfo"] = first.pageInfo;
-  let stop = nodes.map((n) => tagOf(n.oid)).find(Boolean);
-  for (let i = 1; !stop && info?.hasNextPage && i < MAX_HISTORY_PAGES; i++) {
-    const cursor: string | null = info?.endCursor ?? null;
+  const nodes: HistoryNode[] = [...page.nodes];
+  let stop = page.nodes.map((n) => tagOf(n.oid)).find(Boolean);
+  for (
+    let i = 1;
+    !stop && page.pageInfo!.hasNextPage && i < MAX_HISTORY_PAGES;
+    i++
+  ) {
     const more: {
       repository: { ref: { target?: { history?: HistoryPage } } | null } | null;
     } = await graphql(env, token, HISTORY_PAGE_QUERY, {
@@ -651,27 +777,20 @@ export async function readHistory(
       qualified: `refs/heads/${node.name}`,
       hist,
       since,
-      after: cursor,
+      after: page.pageInfo!.endCursor,
     });
-    const page: HistoryPage | undefined = more.repository?.ref?.target?.history;
-    if (
-      !page ||
-      !Array.isArray(page.nodes) ||
-      !page.pageInfo ||
-      typeof page.pageInfo.hasNextPage !== "boolean"
-    ) {
+    page = more.repository?.ref?.target?.history;
+    if (!validPage(page))
       throw new AppError(`history of ${node.name} could not be read`, 502);
-    }
     nodes.push(...page.nodes);
-    info = page.pageInfo;
-    stop = page.nodes.map((n: HistoryNode) => tagOf(n.oid)).find(Boolean);
+    stop = page.nodes.map((n) => tagOf(n.oid)).find(Boolean);
   }
   const commits = toCommits(node, nodes);
   const firstTagged = commits.findIndex((x) => tagOf(x.oid));
   return {
     commits,
     untagged: firstTagged < 0 ? commits : commits.slice(0, firstTagged),
-    incomplete: !stop && Boolean(info?.hasNextPage),
+    incomplete: !stop && page.pageInfo!.hasNextPage,
     stop,
   };
 }
@@ -684,19 +803,26 @@ export async function readHistory(
 export const TAGGED_BY = "Tagged-by: nyuchi-github-app";
 const STAGING_MARK = "(staging)";
 
-export function tagMessage(t: Pick<PlannedTag, "tag" | "channel">): string {
-  return `${t.tag}${t.channel === "staging" ? ` ${STAGING_MARK}` : ""}\n\n${TAGGED_BY}\n`;
+export function tagMessage(
+  t: Pick<PlannedTag, "tag" | "channel" | "pr">,
+): string {
+  const head = `${t.tag}${t.channel === "staging" ? ` ${STAGING_MARK}` : ""}`;
+  const pr = t.pr ? `Pull-request: #${t.pr}\n` : "";
+  return `${head}\n\n${pr}${TAGGED_BY}\n`;
 }
 
 const isStagingTag = (t: TagRef) =>
   (t.message ?? "").split("\n")[0].includes(STAGING_MARK);
 
-/** The one release body both paths (new tag, repair) send. */
+/**
+ * The one release body both paths (new tag, repair) send. GitHub generates
+ * the notes; the merging pull request is linked at the top.
+ */
 export async function createRelease(
   env: Env,
   token: string,
   repo: string,
-  r: { tag: string; prerelease: boolean; latest: boolean },
+  r: { tag: string; prerelease: boolean; latest: boolean; pr?: number | null },
 ): Promise<void> {
   await gh(env, token, `/repos/${repo}/releases`, {
     method: "POST",
@@ -706,21 +832,22 @@ export async function createRelease(
       prerelease: r.prerelease,
       make_latest: r.latest ? "true" : "false",
       generate_release_notes: true,
+      ...(r.pr ? { body: `Merged in #${r.pr}.` } : {}),
     }),
   });
 }
 
 /**
- * Create the annotated tag object, then its ref. The ref creation is the
- * atomic last guard: GitHub answers 422 when the name is taken, which throws.
+ * The annotated tag object. No `tagger` is sent, so GitHub records the
+ * App's bot as tagger. Returns the object's sha.
  */
-export async function createTag(
+export async function createTagObject(
   env: Env,
   token: string,
   repo: string,
   t: PlannedTag,
-): Promise<void> {
-  const { body: tagObj } = await gh(env, token, `/repos/${repo}/git/tags`, {
+): Promise<string> {
+  const { body } = await gh(env, token, `/repos/${repo}/git/tags`, {
     method: "POST",
     body: JSON.stringify({
       tag: t.tag,
@@ -729,45 +856,61 @@ export async function createTag(
       type: "commit",
     }),
   });
-  const sha = (tagObj as { sha?: unknown } | null)?.sha;
-  if (typeof sha !== "string" || !sha) {
+  const sha = (body as { sha?: unknown } | null)?.sha;
+  if (typeof sha !== "string" || !/^[0-9a-f]{40}$/i.test(sha)) {
     throw new AppError("no sha for the tag object", 502);
   }
+  return sha;
+}
+
+/**
+ * The ref, the atomic last guard: GitHub answers 422 when the name is taken.
+ */
+export async function createTagRef(
+  env: Env,
+  token: string,
+  repo: string,
+  tag: string,
+  object: string,
+): Promise<void> {
   await gh(env, token, `/repos/${repo}/git/refs`, {
     method: "POST",
-    body: JSON.stringify({ ref: `refs/tags/${t.tag}`, sha }),
+    body: JSON.stringify({ ref: `refs/tags/${tag}`, sha: object }),
   });
 }
 
-/** Does the repository have a release (drafts included) for this tag? */
-async function releaseFor(
+/** Every release's tag name, drafts included; null if not read in full. */
+async function releaseTags(
   env: Env,
   token: string,
   owner: string,
   name: string,
-  tag: string,
-): Promise<boolean | null> {
+): Promise<Set<string> | null> {
   // GET /releases/tags/{tag} hides drafts, so the list is read instead.
-  // null: not found within the pages read, so unknown (do nothing).
+  const seen = new Set<string>();
   let url: string | null = `/repos/${owner}/${name}/releases?per_page=100`;
   for (let i = 0; url && i < 10; i++) {
-    const res = await gh(env, token, url);
-    const rows = res.body;
-    if (!Array.isArray(rows))
+    const res: GhResponse = await gh(env, token, url);
+    if (!Array.isArray(res.body))
       throw new AppError("releases could not be read", 502);
-    if (rows.some((r) => (r as { tag_name?: unknown }).tag_name === tag))
-      return true;
+    for (const r of res.body) {
+      const t = (r as { tag_name?: unknown }).tag_name;
+      if (typeof t === "string") seen.add(t);
+    }
     const m = /<([^>]+)>;\s*rel="next"/.exec(res.headers.get("link") || "");
     url = m ? m[1] : null;
   }
-  return url ? null : false;
+  return url ? null : seen;
 }
 
 /**
- * Give each tag in the ledger (tags this app made whose release creation
- * failed) its release. A tag that is gone, or already has a release (draft
- * or not), leaves the ledger; one whose commit's workflows would start on a
- * release, or whose release list cannot be read in full, stays for later.
+ * Give each ledger entry (a tag this app wrote whose release is missing) its
+ * release, when every proof still holds:
+ * - the live tag of that name points at the very tag object recorded, and
+ *   peels to the recorded commit (otherwise it is not ours: drop it);
+ * - the commit is still on one of the protected release branches;
+ * - no release exists for it yet, drafts included (if one does, drop it);
+ * - the commit's workflows would not start on a release.
  * Channel and "latest" come from the tag, never from the branch walked.
  */
 export async function repairReleases(
@@ -778,38 +921,64 @@ export async function repairReleases(
   tags: TagRef[],
   prefix: string,
   ledger: ReleaseLedger,
+  branches: string[],
 ): Promise<string[]> {
+  const pending = await ledger.list();
+  if (!pending.length) return [];
+  // A fresh read: the run's in-memory list may miss a ref whose creation
+  // response was lost, and that is exactly the tag this must find.
+  void tags;
+  const live = await allTags(env, token, owner, name);
+  const releases = await releaseTags(env, token, owner, name);
+  const vt = versionTags(live, prefix);
+  const mainTags = vt.filter((t) => !isStagingTag(t));
   const repaired: string[] = [];
-  for (const pending of await ledger.list()) {
-    const tag = versionTags(tags, prefix).find((t) => t.name === pending);
-    if (!tag || tag.unresolved) {
-      await ledger.remove(pending);
+  for (const e of pending) {
+    const tag = vt.find((t) => t.name === e.tag);
+    if (
+      !tag ||
+      tag.unresolved ||
+      tag.object !== e.object ||
+      tag.commit !== e.commit
+    ) {
+      await ledger.remove(e.tag);
       continue;
     }
-    const has = await releaseFor(env, token, owner, name, tag.name);
-    if (has === true) {
-      await ledger.remove(pending);
+    if (releases === null) continue; // unknown: try again later
+    if (releases.has(tag.name)) {
+      await ledger.remove(e.tag);
       continue;
     }
-    if (has === null) continue;
+    let reachable = false;
+    for (const b of branches) {
+      if (
+        (await branchIsProtected(env, token, owner, name, b)) &&
+        (await onBranch(env, token, owner, name, tag.commit, b))
+      ) {
+        reachable = true;
+        break;
+      }
+    }
+    if (!reachable) continue;
     if ((await publishingCommits(env, token, owner, name, [tag.commit])).length)
       continue;
     const prerelease = isStagingTag(tag);
     // "Latest" is the highest default-branch release; staging betas (plain
     // x.y.z too) are left out of the comparison.
-    const mainTags = versionTags(tags, prefix).filter((t) => !isStagingTag(t));
     const latest =
       !prerelease &&
       highest(
         mainTags.map((t) => `refs/tags/${t.name}`),
         prefix,
       ) === tag.name.slice(prefix.length);
+    const pr = /^Pull-request: #(\d+)$/m.exec(tag.message ?? "");
     await createRelease(env, token, `${owner}/${name}`, {
       tag: tag.name,
       prerelease,
       latest,
+      pr: pr ? Number(pr[1]) : null,
     });
-    await ledger.remove(pending);
+    await ledger.remove(e.tag);
     repaired.push(tag.name);
   }
   return repaired;
@@ -823,28 +992,39 @@ export async function allTags(
   name: string,
   first?: TagPage,
 ): Promise<TagRef[]> {
+  const valid = (p: TagPage | undefined): p is TagPage =>
+    Boolean(
+      p &&
+      Array.isArray(p.nodes) &&
+      p.nodes.every((n) => typeof n?.name === "string") &&
+      p.pageInfo &&
+      typeof p.pageInfo.hasNextPage === "boolean",
+    );
   const read = async (after: string | null): Promise<TagPage> => {
     const d = await graphql<{ repository: { tags: TagPage } | null }>(
       env,
       token,
       TAGS_QUERY,
-      { owner, name, tagsAfter: after },
+      {
+        owner,
+        name,
+        tagsAfter: after,
+      },
     );
-    if (!d.repository?.tags || !Array.isArray(d.repository.tags.nodes)) {
+    const p = d.repository?.tags;
+    if (!valid(p))
       throw new AppError(`${owner}/${name}: tags could not be read`, 502);
-    }
-    return d.repository.tags;
+    return p;
   };
   let page: TagPage = first ?? (await read(null));
-  if (!page || !Array.isArray(page.nodes)) {
+  if (!valid(page))
     throw new AppError(`${owner}/${name}: tags could not be read`, 502);
-  }
   const nodes = [...page.nodes];
-  for (let i = 1; page.pageInfo?.hasNextPage && i < MAX_TAG_PAGES; i++) {
+  for (let i = 1; page.pageInfo.hasNextPage && i < MAX_TAG_PAGES; i++) {
     page = await read(page.pageInfo.endCursor);
     nodes.push(...page.nodes);
   }
-  if (page.pageInfo?.hasNextPage) {
+  if (page.pageInfo.hasNextPage) {
     // Not every tag was read, so "highest" and "already tagged" are unknown.
     throw new AppError(
       `${owner}/${name}: more than ${MAX_TAG_PAGES * 100} tags; not tagging`,
@@ -909,7 +1089,7 @@ export async function publishingCommits(
  * Immediately before writing, refuse when the plan is stale:
  * - the name is taken, or the commit already carries a version tag;
  * - the highest version is no longer the one this tag was planned on top of;
- * - the commit is no longer on the branch (a force-push or reset).
+ * - the commit is no longer reachable from the protected branch's head.
  *
  * `made` are the tags this run already wrote: they are added to the live read
  * so that a lagging GraphQL index cannot make this run doubt its own writes.
@@ -953,16 +1133,9 @@ export async function assertStillValid(
       409,
     );
   }
-  // Still on the branch: the branch must be the commit or a descendant of it.
-  const { body } = await gh(
-    env,
-    token,
-    `/repos/${owner}/${name}/compare/${t.commit}...heads/${encodeURIComponent(branch)}`,
-  );
-  const status = (body as { status?: unknown } | null)?.status;
-  if (status !== "ahead" && status !== "identical") {
+  if (!(await onBranch(env, token, owner, name, t.commit, branch))) {
     throw new AppError(
-      `${t.commit.slice(0, 7)} is no longer on ${branch} (${String(status)}); plan is stale`,
+      `${t.commit.slice(0, 7)} is no longer on ${branch}; plan is stale`,
       409,
     );
   }

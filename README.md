@@ -57,10 +57,20 @@ This Worker only decides **which commits are releases**:
   Creating the ref is the final atomic guard: GitHub answers 422 when it
   already exists.
 
-- If a run made a tag but failed to create its release, the next run creates
-  that release. This applies only to tags this app made, which carry
-  `Tagged-by: nyuchi-github-app`. The channel and "latest" come from the tag
-  itself. A dry run reports these repairs.
+- Tags only commits that GitHub reports on a **protected** branch (one with
+  deletion and non-fast-forward rules), read with the app's own
+  authenticated calls. Immediately before the write, the commit is proved
+  reachable from that branch's head again. A webhook payload only says which
+  repository and which channel to look at.
+- Tags are annotated, with the App's bot as tagger, and carry the merging
+  pull request (`Pull-request: #N`). Each release links that pull request
+  above GitHub's generated notes.
+- Each tag this app writes is recorded **before** its ref is created, in a
+  ledger in the repository's `TagLock` Durable Object storage, and the record
+  is cleared once its release exists. A later run gives a recorded tag its
+  missing release, but only while the live tag is still the very tag object
+  recorded and its commit is still on a protected branch. A tag deleted and
+  re-made by anyone else is never touched.
 - One tagging run per repository at a time. Every run, push or nightly, goes
   through a Durable Object (`TagLock`, named after the repository) and runs
   under its lock. Two runs can therefore never put two different versions on
@@ -81,10 +91,11 @@ This Worker only decides **which commits are releases**:
 
 ### What it will not tag
 
-- **Repositories with workflows that can start on a tag push or a release.**
-  This means `push: tags`, `release`, `create` and `workflow_run`, and also
-  any `push` with no `branches` filter, because GitHub runs that for tags
-  too. A tag made by an App starts workflows, which a `GITHUB_TOKEN` tag does
+- **Repositories with workflows that might start on a tag push or a
+  release.** `on:` is read against an allowlist of events that never fire
+  for tags or releases (`pull_request`, `schedule`, `workflow_dispatch` and
+  similar). Any other event counts as publishing, and so does a `push`
+  without a real `branches` filter, because GitHub runs that for tags too. A tag made by an App starts workflows, which a `GITHUB_TOKEN` tag does
   not, so a beta tag could run a production publish.
   - This is checked against the default branch's workflows **and** the
     workflows at every commit about to be tagged. A tag push runs the files at

@@ -90,10 +90,27 @@ test("the release ledger persists in the lock's storage, without duplicates", as
   };
   const l = storageLedger(storage);
   assert.deepEqual(await l.list(), []);
-  await l.add("v0.1.0");
-  await l.add("v0.1.0");
-  await l.add("v0.2.0");
-  assert.deepEqual(await storageLedger(storage).list(), ["v0.1.0", "v0.2.0"]);
+  const e = (tag: string) => ({
+    tag,
+    object: "o".repeat(40),
+    commit: "c".repeat(40),
+  });
+  await l.add(e("v0.1.0"));
+  await l.add(e("v0.1.0"));
+  await l.add(e("v0.2.0"));
+  assert.deepEqual(
+    (await storageLedger(storage).list()).map((x) => x.tag),
+    ["v0.1.0", "v0.2.0"],
+  );
   await l.remove("v0.1.0");
-  assert.deepEqual(await l.list(), ["v0.2.0"]);
+  assert.deepEqual(
+    (await l.list()).map((x) => x.tag),
+    ["v0.2.0"],
+  );
+  // Malformed stored entries are not provenance and are ignored.
+  mem.set("pending-releases-v2", ["v9.9.9", { tag: "v1.0.0" }, e("v0.3.0")]);
+  assert.deepEqual(
+    (await l.list()).map((x) => x.tag),
+    ["v0.3.0"],
+  );
 });

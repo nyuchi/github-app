@@ -34,10 +34,16 @@ while read -r repo sha path local; do
 done < src/policy/POLICY_SOURCE
 # Every vendored file must be pinned: removing a line must not silently
 # unpin (and so fork) it.
-for required in src/policy/next-version.mjs src/policy/version-fixtures.json; do
-  if ! awk '{print $4}' src/policy/POLICY_SOURCE | grep -qxF "$required"; then
-    echo "::error::$required is not pinned in src/policy/POLICY_SOURCE." >&2
+# Each must be pinned to nyuchi/.github's own file, not a fork's.
+while read -r local remote; do
+  if ! awk -v l="$local" -v r="$remote" \
+    '$1 == "nyuchi/.github" && $3 == r && $4 == l { found = 1 } END { exit !found }' \
+    src/policy/POLICY_SOURCE; then
+    echo "::error::$local must be pinned to nyuchi/.github $remote in src/policy/POLICY_SOURCE." >&2
     status=1
   fi
-done
+done <<'REQUIRED'
+src/policy/next-version.mjs .github/actions/next-version/next-version.mjs
+src/policy/version-fixtures.json .github/actions/next-version/version-fixtures.json
+REQUIRED
 exit "$status"

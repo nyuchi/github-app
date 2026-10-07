@@ -19,6 +19,9 @@ test("every export declared in next-version.d.mts exists in the vendored module"
   for (const name of declared) {
     assert.ok(name in policy, `${name} is declared but not exported`);
   }
+  for (const name of Object.keys(policy)) {
+    assert.ok(declared.includes(name), `${name} is exported but not declared`);
+  }
   assert.deepEqual(Object.keys(policy.parse("1.2.3")).sort(), [
     "major",
     "minor",

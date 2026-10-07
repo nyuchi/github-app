@@ -10,7 +10,7 @@ import {
   TAGGING_PERMISSIONS,
 } from "./app";
 import { scanLocked, type TagLockNamespace } from "./lock";
-import { intSetting, type RepoReport } from "./scan";
+import { intSetting, maxPerRepo, type RepoReport } from "./scan";
 
 interface Repo {
   name: string;
@@ -46,13 +46,7 @@ export async function nightly(
   const result: NightlyResult = { orgs: [], repos: 0, reports: [], errors: [] };
   // A ceiling on tags per night, so a first live night across the
   // enterprise stays inside the Worker's subrequest limit.
-  const perRepo = intSetting(
-    "BACKFILL_MAX_PER_REPO",
-    env.BACKFILL_MAX_PER_REPO,
-    10,
-    0,
-    1000,
-  );
+  const perRepo = maxPerRepo(env);
   let remaining = intSetting(
     "NIGHTLY_MAX_TAGS",
     env.NIGHTLY_MAX_TAGS,
@@ -107,9 +101,9 @@ export async function nightly(
       remaining = Math.max(0, remaining);
       result.reports.push(report);
     } catch (e) {
-      // The run may have written before failing (scanRepo itself reports
-      // after writes; this is the RPC or the lock failing). Assume the worst
-      // for the budget: this repository may have used its full allowance.
+      // scanRepo never throws, so this is the RPC or the lock failing, and
+      // the run may have written before it did. Assume the worst for the
+      // budget: this repository may have used its full allowance.
       remaining = Math.max(0, remaining - perRepo * 2);
       result.errors.push(
         `${repo.owner.login}/${repo.name}: ${e instanceof Error ? e.message : String(e)}`,

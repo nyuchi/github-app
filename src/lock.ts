@@ -13,6 +13,7 @@
 
 import type { Env } from "./env";
 import {
+  type LedgerEntry,
   type ReleaseLedger,
   type RepoReport,
   type ScanOptions,
@@ -89,21 +90,33 @@ export interface KV {
 
 /** The release ledger kept in the repository's own Durable Object storage. */
 export function storageLedger(storage: KV): ReleaseLedger {
-  const KEY = "pending-releases";
-  const read = async () => (await storage.get<string[]>(KEY)) ?? [];
+  const KEY = "pending-releases-v2";
+  const read = async (): Promise<LedgerEntry[]> => {
+    const v = await storage.get<unknown>(KEY);
+    if (!Array.isArray(v)) return [];
+    // Keep only well-formed entries; anything else is not provenance.
+    return v.filter(
+      (e): e is LedgerEntry =>
+        !!e &&
+        typeof (e as LedgerEntry).tag === "string" &&
+        typeof (e as LedgerEntry).object === "string" &&
+        typeof (e as LedgerEntry).commit === "string",
+    );
+  };
   return {
     list: read,
-    async add(tag) {
-      const all = await read();
-      if (!all.includes(tag)) await storage.put(KEY, [...all, tag]);
+    async add(entry) {
+      const all = (await read()).filter((e) => e.tag !== entry.tag);
+      await storage.put(KEY, [...all, entry]);
     },
     async remove(tag) {
       const all = await read();
-      if (all.includes(tag))
+      if (all.some((e) => e.tag === tag)) {
         await storage.put(
           KEY,
-          all.filter((t) => t !== tag),
+          all.filter((e) => e.tag !== tag),
         );
+      }
     },
   };
 }
