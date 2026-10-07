@@ -1,0 +1,218 @@
+[
+  {
+    "input": "0.0.0",
+    "valid": true
+  },
+  {
+    "input": "0.0.1",
+    "valid": true
+  },
+  {
+    "input": "1.2.3",
+    "valid": true
+  },
+  {
+    "input": "0.27.4",
+    "valid": true
+  },
+  {
+    "input": "10.20.30",
+    "valid": true
+  },
+  {
+    "input": "999.999.999",
+    "valid": true
+  },
+  {
+    "input": "999.0.0",
+    "valid": true
+  },
+  {
+    "input": "0.999.0",
+    "valid": true
+  },
+  {
+    "input": "0.0.999",
+    "valid": true
+  },
+  {
+    "input": "100.0.9",
+    "valid": true
+  },
+  {
+    "input": "1000.0.0",
+    "valid": false
+  },
+  {
+    "input": "0.1000.0",
+    "valid": false
+  },
+  {
+    "input": "0.0.1000",
+    "valid": false
+  },
+  {
+    "input": "9999.9.9",
+    "valid": false
+  },
+  {
+    "input": "01.2.3",
+    "valid": false
+  },
+  {
+    "input": "1.02.3",
+    "valid": false
+  },
+  {
+    "input": "1.2.03",
+    "valid": false
+  },
+  {
+    "input": "00.0.0",
+    "valid": false
+  },
+  {
+    "input": "0.00.0",
+    "valid": false
+  },
+  {
+    "input": "0.0.00",
+    "valid": false
+  },
+  {
+    "input": "v1.2.3",
+    "valid": false
+  },
+  {
+    "input": "V1.2.3",
+    "valid": false
+  },
+  {
+    "input": " 1.2.3",
+    "valid": false
+  },
+  {
+    "input": "1.2.3 ",
+    "valid": false
+  },
+  {
+    "input": "\t1.2.3",
+    "valid": false
+  },
+  {
+    "input": "1.2.3\n",
+    "valid": false
+  },
+  {
+    "input": "\n1.2.3",
+    "valid": false
+  },
+  {
+    "input": "1.2.3\r\n",
+    "valid": false
+  },
+  {
+    "input": "1.2.3-rc.1",
+    "valid": false
+  },
+  {
+    "input": "1.2.3-0",
+    "valid": false
+  },
+  {
+    "input": "1.2.3+b",
+    "valid": false
+  },
+  {
+    "input": "1.2.3-rc.1+b",
+    "valid": false
+  },
+  {
+    "input": "1.2",
+    "valid": false
+  },
+  {
+    "input": "1",
+    "valid": false
+  },
+  {
+    "input": "1.2.3.4",
+    "valid": false
+  },
+  {
+    "input": "",
+    "valid": false
+  },
+  {
+    "input": " ",
+    "valid": false
+  },
+  {
+    "input": "1..3",
+    "valid": false
+  },
+  {
+    "input": ".1.2.3",
+    "valid": false
+  },
+  {
+    "input": "1.2.3.",
+    "valid": false
+  },
+  {
+    "input": "-1.2.3",
+    "valid": false
+  },
+  {
+    "input": "+1.2.3",
+    "valid": false
+  },
+  {
+    "input": "1.2.x",
+    "valid": false
+  },
+  {
+    "input": "a.b.c",
+    "valid": false
+  },
+  {
+    "input": "1.2.3a",
+    "valid": false
+  },
+  {
+    "input": "banana",
+    "valid": false
+  },
+  {
+    "input": "1e2.0.0",
+    "valid": false
+  },
+  {
+    "input": "0x1.2.3",
+    "valid": false
+  },
+  {
+    "input": "١.٢.٣",
+    "valid": false
+  },
+  {
+    "input": "1.2.３",
+    "valid": false
+  },
+  {
+    "input": "１.2.3",
+    "valid": false
+  },
+  {
+    "input": "1.2.3\u0000",
+    "valid": false
+  },
+  {
+    "input": "1,2,3",
+    "valid": false
+  },
+  {
+    "input": "1.2.3​",
+    "valid": false
+  }
+]
