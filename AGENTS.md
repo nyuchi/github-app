@@ -9,7 +9,7 @@ decisions and status: nyuchi/.github#90.
 
 - Big work lives in GitHub issues (nyuchi/.github#90 for this app). Link it
   from every PR.
-- Feature PRs target `staging`; `staging` to `main` is a release. Squash or
+- PRs target `main`; every merge to `main` is a release. Squash or
   rebase, linear history, no ruleset bypass, no `--no-verify`. Merge only when
   done, CI is green, it is verified at runtime and `/code-review` ran clean.
 - The versioning policy is NEVER edited here. `src/policy/next-version.mjs` is
