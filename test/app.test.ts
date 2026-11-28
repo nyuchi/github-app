@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createPublicKey, createVerify, createPrivateKey } from "node:crypto";
 import { test } from "node:test";
 
-import { appJwt, parsePermissions } from "../src/app";
+import { api, appJwt, parsePermissions, trimTrailingSlashes } from "../src/app";
 import { PEM, secret, testEnv } from "./helpers";
 
 test("the App JWT is RS256, issued by the app id, nine minutes, backdated a minute", async () => {
@@ -35,4 +35,34 @@ test("permission specs parse into GitHub's shape", () => {
     contents: "write",
     metadata: "read",
   });
+});
+
+test("trimTrailingSlashes removes only trailing slashes, in linear time", () => {
+  assert.equal(
+    trimTrailingSlashes("https://api.github.com"),
+    "https://api.github.com",
+  );
+  assert.equal(
+    trimTrailingSlashes("https://api.github.com/"),
+    "https://api.github.com",
+  );
+  assert.equal(
+    trimTrailingSlashes("https://ghe.example/api/v3///"),
+    "https://ghe.example/api/v3",
+  );
+  assert.equal(trimTrailingSlashes("///"), "");
+  assert.equal(trimTrailingSlashes(""), "");
+  // A long run of slashes followed by a non-slash is what made `/\/+$/` backtrack.
+  const hostile = "/".repeat(200_000) + "x";
+  const t = Date.now();
+  assert.equal(trimTrailingSlashes(hostile), hostile);
+  assert.ok(Date.now() - t < 1000, "must not backtrack");
+});
+
+test("api() trims the configured GitHub API base", () => {
+  assert.equal(
+    api({ GITHUB_API: "https://ghe.example/api/v3//" } as never),
+    "https://ghe.example/api/v3",
+  );
+  assert.equal(api({} as never), "https://api.github.com");
 });

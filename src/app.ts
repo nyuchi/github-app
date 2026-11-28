@@ -17,8 +17,15 @@ export class AppError extends Error {
   }
 }
 
+/** Drop trailing slashes with a scan, not `/\/+$/`, which backtracks on a long run of `/`. */
+export function trimTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47) end--;
+  return value.slice(0, end);
+}
+
 export const api = (env: Env) =>
-  (env.GITHUB_API || "https://api.github.com").replace(/\/+$/, "");
+  trimTrailingSlashes(env.GITHUB_API || "https://api.github.com");
 
 const b64url = (bytes: Uint8Array) => {
   let s = "";
